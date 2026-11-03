@@ -240,7 +240,8 @@ deployment configuration.
 4. [ ] - `p1` - A fact candidate's plan loses every remove and replace step before the checks run, so a candidate
    only adds, whatever its claim made the model answer - `inst-process-candidate`
 5. [ ] - `p1` - The writer stores the admitted plan in one write that expects the profile version the plan was built
-   on - `inst-process-write`
+   on, awaited for at most 90 seconds; past that the write may still land, and the record is dropped as a failed
+   write. So every write ends within a bound an erasure can wait out - `inst-process-write`
 6. [ ] - `p1` - When the profile changed, the record is planned again on a new read of the profile, at most
    the given number of times. Past that, the record is dropped at the writer stage with `rerun_limit` -
    `inst-process-rerun`

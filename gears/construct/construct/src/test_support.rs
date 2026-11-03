@@ -188,6 +188,23 @@ impl TenantDefaults for FixedDefaults {
     }
 }
 
+/// The tenant's personalization default, read after `.1`.
+pub struct DelayedDefaults(pub bool, pub std::time::Duration);
+
+#[async_trait]
+impl TenantDefaults for DelayedDefaults {
+    async fn personalization_default(
+        &self,
+        _ctx: &SecurityContext,
+        _tenant_id: Uuid,
+    ) -> Result<bool, DomainError> {
+        if !self.1.is_zero() {
+            tokio::time::sleep(self.1).await;
+        }
+        Ok(self.0)
+    }
+}
+
 /// A subject settings service on `db`, with `resolver` as the policy service
 /// and `personalization_default` as every tenant's default.
 pub fn settings_service(
@@ -201,6 +218,13 @@ pub fn settings_service(
         Arc::new(FixedDefaults(personalization_default)),
         PolicyEnforcer::new(resolver),
     )
+}
+
+/// Construct's own tables as erasure and retention change them.
+pub fn deletion_tables(db: &Db) -> Arc<crate::infra::storage::deletion_repo::DeletionTables> {
+    Arc::new(crate::infra::storage::deletion_repo::DeletionTables::new(
+        Arc::new(DBProvider::new(db.clone())),
+    ))
 }
 
 /// Stores one subject's settings row, through the secure ORM with a scope for
@@ -221,6 +245,9 @@ pub async fn insert_subject_settings(
         subject_id: ActiveValue::Set(key.subject_id),
         personalization_enabled: ActiveValue::Set(personalization_enabled),
         erasure_in_progress: erasure_in_progress.map_or(ActiveValue::NotSet, ActiveValue::Set),
+        profile_generation: ActiveValue::NotSet,
+        erasure_marked_at: ActiveValue::NotSet,
+        erasure_attempted_at: ActiveValue::NotSet,
     };
     let conn = db.conn().expect("connection");
     subject_settings_entity::Entity::insert(row.clone())
@@ -539,6 +566,11 @@ pub struct IntakeFixture {
     pub policy_deadline: Option<std::time::Duration>,
     /// Hand received records here instead, such as the processing queue.
     pub hand_off_to: Option<Arc<dyn RecordHandOff>>,
+    /// How long the tenant's default takes to read, inside the receive
+    /// window.
+    pub tenant_default_delay: std::time::Duration,
+    /// The tenants' retention periods; none by default.
+    pub retention: crate::config::RetentionConfig,
 }
 
 impl Default for IntakeFixture {
@@ -555,6 +587,8 @@ impl Default for IntakeFixture {
             events: Arc::new(RecordingEvents::default()),
             policy_deadline: None,
             hand_off_to: None,
+            tenant_default_delay: std::time::Duration::ZERO,
+            retention: crate::config::RetentionConfig::default(),
         }
     }
 }
@@ -582,7 +616,10 @@ impl IntakeFixture {
         let settings = Arc::new(SubjectSettingsService::new(
             Arc::clone(&db),
             Arc::new(SeaOrmSubjectSettingsRepository::new()),
-            Arc::new(FixedDefaults(self.personalization_default)),
+            Arc::new(DelayedDefaults(
+                self.personalization_default,
+                self.tenant_default_delay,
+            )),
             enforcer.clone(),
         ));
         RecordIntakeService::new(
@@ -593,6 +630,11 @@ impl IntakeFixture {
                 types: Arc::clone(&self.types),
                 switch: Arc::new(ConfigConnectorSwitch::new(self.connectors_off.clone())),
                 hand_off,
+                retention: Arc::new(
+                    crate::infra::retention_periods::ConfigRetentionPeriods::new(
+                        self.retention.clone(),
+                    ),
+                ),
             },
             enforcer,
         )
@@ -974,6 +1016,7 @@ pub fn profile_service_reviewed(
             )),
             events: events as Arc<dyn ProfileEvents>,
             reviews,
+            retention: no_retention(),
         },
         PolicyEnforcer::new(resolver),
         check,
@@ -1234,7 +1277,8 @@ impl MemoryWriter {
             crate::domain::plan::Origin::Agent { .. } => Some(OriginKind::Agent),
             crate::domain::plan::Origin::Connector { .. } => Some(OriginKind::Connector),
             crate::domain::plan::Origin::Reviewer { .. } => Some(OriginKind::Reviewer),
-            crate::domain::plan::Origin::Subject { .. } => None,
+            crate::domain::plan::Origin::Subject { .. }
+            | crate::domain::plan::Origin::Retention => None,
         };
         let removed: Vec<&NodeKey> = plan
             .steps
@@ -1460,6 +1504,8 @@ pub struct MemoryReviews {
     pub claim_delay: std::sync::Mutex<std::time::Duration>,
     /// Answer each record of a write this long after making it.
     pub pend_delay: std::sync::Mutex<std::time::Duration>,
+    /// How many closes of an open request on a fact were asked for.
+    pub close_open_calls: std::sync::atomic::AtomicUsize,
     /// What each request's claim recorded, by request id.
     pub pending:
         std::sync::Mutex<std::collections::HashMap<Uuid, crate::domain::review_queue::Closed>>,
@@ -1791,6 +1837,8 @@ impl crate::domain::review_queue::ReviewRequests for MemoryReviews {
         closed: &crate::domain::review_queue::Closed,
     ) -> Result<Option<crate::domain::review_queue::ReviewRequest>, DomainError> {
         self.check()?;
+        self.close_open_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self
             .close_open_fails
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -1908,4 +1956,294 @@ impl crate::domain::admin_facts::AdminFactsEvents for RecordingAdminEvents {
     fn record(&self, event: crate::domain::admin_facts::AdminFactsEvent) {
         self.events.lock().unwrap().push(event);
     }
+}
+
+// --- Deletion ---
+
+/// [`DeletionStore`](crate::domain::deletion::DeletionStore) in memory: the
+/// marks with their time, and every finish and expiry asked for. The scope
+/// is not applied; the store's own tests show it.
+#[derive(Default)]
+pub struct MemoryDeletionStore {
+    pub marks: std::sync::Mutex<std::collections::BTreeMap<(Uuid, Uuid), time::OffsetDateTime>>,
+    /// When the leader's job last tried each erasure under way.
+    pub attempts: std::sync::Mutex<std::collections::BTreeMap<(Uuid, Uuid), time::OffsetDateTime>>,
+    pub finished: std::sync::Mutex<Vec<SubjectKey>>,
+    pub expired: std::sync::Mutex<Vec<(Uuid, time::OffsetDateTime)>>,
+    pub tenants: std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
+    /// Refuse every mark as out of scope.
+    pub out_of_scope: std::sync::atomic::AtomicBool,
+    /// What each expiry reports it removed.
+    pub expired_rows: std::sync::Mutex<crate::domain::deletion::ExpiredRows>,
+    /// Find every mark gone at the finish, as if another run finished it.
+    pub finish_lost: std::sync::atomic::AtomicBool,
+    /// Fail the expiry of this tenant.
+    pub failing_tenant: std::sync::Mutex<Option<Uuid>>,
+    /// Fail the list of tenants.
+    pub tenants_down: std::sync::atomic::AtomicBool,
+}
+
+impl MemoryDeletionStore {
+    /// Mark `key` as erasing since `at`.
+    pub fn mark_at(&self, key: SubjectKey, at: time::OffsetDateTime) {
+        self.marks
+            .lock()
+            .unwrap()
+            .insert((key.tenant_id, key.subject_id), at);
+    }
+
+    pub fn is_marked(&self, key: SubjectKey) -> bool {
+        self.marks
+            .lock()
+            .unwrap()
+            .contains_key(&(key.tenant_id, key.subject_id))
+    }
+
+    pub fn finished(&self) -> Vec<SubjectKey> {
+        self.finished.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl crate::domain::deletion::DeletionStore for MemoryDeletionStore {
+    async fn mark(
+        &self,
+        _scope: &AccessScope,
+        key: SubjectKey,
+        at: time::OffsetDateTime,
+    ) -> Result<crate::domain::subject_settings::SettingsWrite, DomainError> {
+        use crate::domain::subject_settings::{ScopeRefusal, SettingsWrite};
+        if self.out_of_scope.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(SettingsWrite::OutOfScope(ScopeRefusal::NotCovered));
+        }
+        self.marks
+            .lock()
+            .unwrap()
+            .entry((key.tenant_id, key.subject_id))
+            .or_insert(at);
+        Ok(SettingsWrite::Written)
+    }
+
+    async fn marked(
+        &self,
+        _scope: &AccessScope,
+        key: SubjectKey,
+    ) -> Result<Option<time::OffsetDateTime>, DomainError> {
+        Ok(self
+            .marks
+            .lock()
+            .unwrap()
+            .get(&(key.tenant_id, key.subject_id))
+            .copied())
+    }
+
+    async fn finish(&self, _scope: &AccessScope, key: SubjectKey) -> Result<bool, DomainError> {
+        if self.finish_lost.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let removed = self
+            .marks
+            .lock()
+            .unwrap()
+            .remove(&(key.tenant_id, key.subject_id))
+            .is_some();
+        if removed {
+            self.attempts
+                .lock()
+                .unwrap()
+                .remove(&(key.tenant_id, key.subject_id));
+            self.finished.lock().unwrap().push(key);
+        }
+        Ok(removed)
+    }
+
+    async fn attempted(
+        &self,
+        key: SubjectKey,
+        at: time::OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        if self.is_marked(key) {
+            self.attempts
+                .lock()
+                .unwrap()
+                .insert((key.tenant_id, key.subject_id), at);
+        }
+        Ok(())
+    }
+
+    async fn under_way(
+        &self,
+        marked_before: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<SubjectKey>, DomainError> {
+        let attempts = self.attempts.lock().unwrap().clone();
+        let mut stopped: Vec<(time::OffsetDateTime, SubjectKey)> = self
+            .marks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, at)| **at < marked_before)
+            .map(|(id, at)| {
+                (
+                    attempts.get(id).copied().unwrap_or(*at),
+                    SubjectKey {
+                        tenant_id: id.0,
+                        subject_id: id.1,
+                    },
+                )
+            })
+            .collect();
+        stopped.sort_by_key(|(at, _)| *at);
+        Ok(stopped
+            .into_iter()
+            .take(usize::try_from(limit).unwrap())
+            .map(|(_, key)| key)
+            .collect())
+    }
+
+    async fn expire(
+        &self,
+        _scope: &AccessScope,
+        tenant_id: Uuid,
+        before: time::OffsetDateTime,
+    ) -> Result<crate::domain::deletion::ExpiredRows, DomainError> {
+        if *self.failing_tenant.lock().unwrap() == Some(tenant_id) {
+            return Err(DomainError::Unavailable("the database is down".to_owned()));
+        }
+        self.expired.lock().unwrap().push((tenant_id, before));
+        Ok(*self.expired_rows.lock().unwrap())
+    }
+
+    async fn tenants(&self) -> Result<std::collections::BTreeSet<Uuid>, DomainError> {
+        if self.tenants_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DomainError::Unavailable("the database is down".to_owned()));
+        }
+        Ok(self.tenants.lock().unwrap().clone())
+    }
+}
+
+/// [`ProfileRoots`](crate::domain::deletion::ProfileRoots) that answers from
+/// a script, then removed, and counts its calls.
+#[derive(Default)]
+pub struct ScriptedRoots {
+    pub answers: std::sync::Mutex<
+        std::collections::VecDeque<Result<crate::domain::deletion::RootRemoval, DomainError>>,
+    >,
+    pub calls: std::sync::atomic::AtomicUsize,
+    /// Panic at the next call, once.
+    pub panic_once: std::sync::atomic::AtomicBool,
+    /// How long each call takes.
+    pub takes: std::sync::Mutex<std::time::Duration>,
+    /// The calls running now, and the most that ever ran at once.
+    pub in_flight: std::sync::atomic::AtomicUsize,
+    pub most_at_once: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl crate::domain::deletion::ProfileRoots for ScriptedRoots {
+    async fn remove_root(
+        &self,
+        _ctx: &SecurityContext,
+        _key: SubjectKey,
+    ) -> Result<crate::domain::deletion::RootRemoval, DomainError> {
+        use std::sync::atomic::Ordering;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !self.panic_once.swap(false, Ordering::SeqCst),
+            "the root removal panicked"
+        );
+        let takes = *self.takes.lock().unwrap();
+        if !takes.is_zero() {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_at_once.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(takes).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(crate::domain::deletion::RootRemoval::Removed))
+    }
+}
+
+/// [`ProfileDirectory`](crate::domain::deletion::ProfileDirectory) over
+/// fixed pages, keyed by the cursor each page starts at; it keeps the
+/// cursors asked for.
+#[derive(Default)]
+pub struct FixedDirectory {
+    pub pages: Vec<crate::domain::deletion::SubjectsPage>,
+    pub asked: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+#[async_trait]
+impl crate::domain::deletion::ProfileDirectory for FixedDirectory {
+    async fn subjects(
+        &self,
+        _ctx: &SecurityContext,
+        cursor: Option<String>,
+    ) -> Result<crate::domain::deletion::SubjectsPage, DomainError> {
+        self.asked.lock().unwrap().push(cursor.clone());
+        let index = cursor.map_or(0, |cursor| cursor.parse::<usize>().unwrap());
+        Ok(self.pages.get(index).cloned().unwrap_or_default())
+    }
+}
+
+/// Keeps every Deletion event.
+#[derive(Default)]
+pub struct RecordingDeletionEvents {
+    events: std::sync::Mutex<Vec<crate::domain::deletion::DeletionEvent>>,
+}
+
+impl RecordingDeletionEvents {
+    pub fn taken(&self) -> Vec<crate::domain::deletion::DeletionEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl crate::domain::deletion::DeletionEvents for RecordingDeletionEvents {
+    fn record(&self, event: crate::domain::deletion::DeletionEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+/// Keeps every erasure handed on.
+#[derive(Default)]
+pub struct RecordingErasures {
+    pub queued: std::sync::Mutex<Vec<SubjectKey>>,
+}
+
+impl crate::domain::erasure::ErasureQueue for RecordingErasures {
+    fn enqueue(&self, key: SubjectKey) {
+        self.queued.lock().unwrap().push(key);
+    }
+}
+
+/// Deletion over an empty profile and in-memory stores, with `store` for
+/// the erasures a test marks.
+pub fn deletion_over(store: Arc<MemoryDeletionStore>) -> Arc<crate::domain::deletion::Deletion> {
+    use crate::domain::deletion::{Deletion, DeletionPorts};
+    let profile = MemoryProfile::empty();
+    Arc::new(Deletion::new(DeletionPorts {
+        writes: Arc::new(profile_writes(
+            Arc::clone(&profile),
+            MemoryWriter::new(profile, 0),
+            Some(Uuid::new_v4()),
+        )),
+        roots: Arc::new(ScriptedRoots::default()),
+        directory: Arc::new(FixedDirectory::default()),
+        store,
+        reviews: Arc::new(MemoryReviews::default()),
+        review_events: Arc::new(RecordingReviewEvents::default()),
+        events: Arc::new(RecordingDeletionEvents::default()),
+    }))
+}
+
+/// Retention periods with no period for any tenant: everything is kept.
+pub fn no_retention() -> Arc<dyn crate::domain::deletion::RetentionPeriods> {
+    Arc::new(
+        crate::infra::retention_periods::ConfigRetentionPeriods::new(
+            crate::config::RetentionConfig::default(),
+        ),
+    )
 }

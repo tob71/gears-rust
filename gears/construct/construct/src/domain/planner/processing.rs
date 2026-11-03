@@ -6,7 +6,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
 
 use super::agent::{AgentMessage, Planner};
 use crate::domain::admission::{Admission, AdmissionOutcome};
@@ -360,8 +360,6 @@ impl Processing {
             return Ok(Run::Done);
         }
         match self
-            .ports
-            .writer
             .write(ctx, &admitted)
             .await
             .map_err(|_| Failure::Write)?
@@ -461,6 +459,20 @@ impl Processing {
 }
 
 impl Processing {
+    /// Write `plan`, awaiting the writer for at most [`WRITER_LIMIT`], so an
+    /// erasure that waits out every write admitted before its mark waits out
+    /// this one too. Past the limit the write may still land; the record is
+    /// dropped as unwritten, which the erasure's second removal covers.
+    async fn write(&self, ctx: &SecurityContext, plan: &Plan) -> Result<Written, DomainError> {
+        timeout(WRITER_LIMIT, self.ports.writer.write(ctx, plan))
+            .await
+            .unwrap_or_else(|_| {
+                Err(DomainError::Unavailable(format!(
+                    "the profile write did not end within {WRITER_LIMIT:?}; it may have landed"
+                )))
+            })
+    }
+
     /// Drops every step of `plan` that would change or remove a fact under an
     /// open review request, or add a property to it. The planner still sees
     /// the fact, so the model does not add it again. `construct` is

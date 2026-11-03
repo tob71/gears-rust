@@ -508,6 +508,31 @@ async fn a_write_that_started_is_awaited_past_the_deadline_before_the_write() {
     assert!(matches!(managed, Managed::Stored(_)), "{managed:?}");
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_records_write_that_never_ends_is_dropped_at_the_writer_limit() {
+    let chain = Chain {
+        writer: Arc::new(Writer {
+            takes: crate::domain::profile_writes::WRITER_LIMIT * 2,
+            ..Arc::into_inner(Writer::answering(&[Ok(Written::Stored)])).expect("one owner")
+        }),
+        ..Chain::new(adding_rust(1), &[Ok(Written::Stored)])
+    };
+    let started = Instant::now();
+
+    chain.process(&record()).await;
+
+    // An erasure waits out every write admitted before its mark; a write
+    // that ran on would outlast that wait.
+    assert_eq!(
+        started.elapsed(),
+        crate::domain::profile_writes::WRITER_LIMIT
+    );
+    assert_eq!(
+        chain.events.taken(),
+        dropped(DropStage::Writer, DropReason::ProcessingFailed)
+    );
+}
+
 #[tokio::test]
 async fn the_write_runs_by_the_answer_deadline() {
     let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);

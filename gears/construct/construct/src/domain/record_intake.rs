@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
@@ -14,6 +15,7 @@ use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use super::DbProvider;
+use super::deletion::{RetentionPeriods, period_start};
 use super::error::DomainError;
 use super::plan::{Origin, Plan};
 pub use super::refusal::{Place, Refusal, RefusalReason};
@@ -30,6 +32,19 @@ pub(crate) const RECORD_RESOURCE: ResourceType =
 
 pub(crate) mod actions {
     pub const SEND: &str = "send";
+}
+
+/// The longest a record takes from the read of its subject's settings to the
+/// insert of its identity, which the hand-off and the commit follow at once.
+/// Past it the record is not taken, so a record checked before an erasure's
+/// mark keeps its identity soon after this after the mark.
+pub const RECEIVE_WINDOW: Duration = Duration::from_secs(10);
+
+/// A record not taken within the receive window: nothing was kept.
+fn not_taken() -> DomainError {
+    DomainError::Unavailable(format!(
+        "the record was not taken within {RECEIVE_WINDOW:?}; nothing is kept, send it again"
+    ))
 }
 
 /// What intake answers for a record it takes. The crate owns this enum, so a
@@ -495,6 +510,10 @@ pub struct IntakePorts {
     pub types: Arc<dyn RecordTypes>,
     pub switch: Arc<dyn ConnectorSwitch>,
     pub hand_off: Arc<dyn RecordHandOff>,
+    /// The tenants' retention periods: a record observed before its
+    /// tenant's period began is refused, so retention's removal of a record
+    /// identity does not let it be stored again.
+    pub retention: Arc<dyn RetentionPeriods>,
 }
 
 #[domain_model]
@@ -507,6 +526,8 @@ pub struct RecordIntakeService<
     settings: Arc<SubjectSettingsService<S>>,
     ports: IntakePorts,
     policy_enforcer: PolicyEnforcer,
+    /// [`RECEIVE_WINDOW`]; a test shortens it to run on the real clock.
+    receive_window: Duration,
 }
 
 /// @cpt-dod:cpt-cf-construct-dod-record-intake-checks:p1
@@ -526,7 +547,18 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
             settings,
             ports,
             policy_enforcer,
+            receive_window: RECEIVE_WINDOW,
         }
+    }
+
+    /// The same intake with a shorter receive window, so a test of the
+    /// window runs on the real clock: a paused clock jumps to the deadline
+    /// while the database works on its own thread.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_receive_window(mut self, window: Duration) -> Self {
+        self.receive_window = window;
+        self
     }
 
     /// Take one record a connector sends for `tenant_id`. Answers received or
@@ -565,35 +597,59 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
         // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-authorize
 
         let envelope = self.check_record(&record).await?;
-        self.check_tenant_and_subject(ctx, &scope, tenant_id, connector, &envelope)
-            .await?;
-
+        // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-window
+        // From the read of the subject's settings to the insert of the
+        // identity, a record takes at most the receive window. The hand-off
+        // and the commit follow at once, so an erasure that waits several
+        // windows after its mark also finds this record's identity.
+        let deadline = tokio::time::Instant::now() + self.receive_window;
+        tokio::time::timeout_at(
+            deadline,
+            self.check_tenant_and_subject(ctx, &scope, tenant_id, connector, &envelope),
+        )
+        .await
+        .map_err(|_| not_taken())??;
         let received = ReceivedRecord {
             tenant_id,
             connector: connector.to_string(),
             envelope,
             record,
         };
-        self.take(scope, received).await
+        self.take(scope, received, deadline).await
+        // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-window
     }
 
     /// Insert the record's identity and hand the record off, in one
     /// transaction: a repeat changes nothing, and a hand-off that refuses the
-    /// record rolls the identity back.
+    /// record rolls the identity back. An insert that does not end by
+    /// `deadline` rolls back too, before the hand-off, so nothing is kept.
     async fn take(
         &self,
         scope: AccessScope,
         received: ReceivedRecord,
+        deadline: tokio::time::Instant,
     ) -> Result<IntakeOutcome, DomainError> {
         let ids = Arc::clone(&self.ids);
         let hand_off = Arc::clone(&self.ports.hand_off);
-        self.db
+        let tenant_id = received.tenant_id;
+        // Named in the late-commit warning, so the erasure to look at is known.
+        let (subject_id, record_key) = (
+            received.envelope.subject_id,
+            RecordId::of_record(&received).key,
+        );
+        let taken = self
+            .db
             .db()
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-insert
                     let id = RecordId::of_record(&received);
-                    let inserted = ids.insert(tx, &scope, id).await?;
+                    // Dropping the insert at the deadline is safe: it runs in
+                    // this transaction, which then rolls back, so a half-done
+                    // insert keeps nothing.
+                    let inserted = tokio::time::timeout_at(deadline, ids.insert(tx, &scope, id))
+                        .await
+                        .map_err(|_| not_taken())??;
                     // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-insert
                     match inserted {
                         // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-repeat
@@ -607,7 +663,9 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
                     }
                 })
             })
-            .await
+            .await;
+        warn_if_committed_late(deadline, &taken, tenant_id, subject_id, &record_key);
+        taken
     }
 
     /// The record's own checks: no `id`, and its type and the types it derives
@@ -655,8 +713,11 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
         // @cpt-end:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-envelope
     }
 
-    /// The tenant's and the subject's checks: the connector is on, and, for a
-    /// record about a subject, personalization is on with no erasure under way.
+    /// The tenant's and the subject's checks: the connector is on, the record
+    /// was observed within the tenant's retention period, and, for a record
+    /// about a subject, personalization is on with no erasure under way.
+    // cancel-safe: it only reads the connector switch and the subject's
+    // settings, so the receive window can drop it at any point.
     async fn check_tenant_and_subject(
         &self,
         ctx: &SecurityContext,
@@ -678,6 +739,22 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
             );
         }
         // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-connector
+
+        // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-retention
+        // Retention removed what was observed before the period began, and the
+        // record's identity with it; such a record taken again would be
+        // stored afresh and kept another whole period.
+        if let Some(period) = self.ports.retention.period(tenant_id).await?
+            && period_start(OffsetDateTime::now_utc(), period)
+                .is_some_and(|start| envelope.observed_at < start)
+        {
+            return refuse(
+                RefusalReason::PastRetention,
+                Place::pointer("/observed_at"),
+                "the record was observed before the tenant's retention period began",
+            );
+        }
+        // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-retention
 
         // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-subject
         let Some(subject_id) = envelope.subject_id else {
@@ -710,5 +787,30 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
         }
         Ok(())
         // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-subject
+    }
+}
+
+/// Warn when a record was taken but its identity was committed after
+/// `deadline`. The commit is not bounded, and one that ended past the
+/// deadline leaves less of an erasure's wait than it counts on: an erasure
+/// of the subject may have missed the identity. The subject and the record
+/// are named, so the erasure to look at is known.
+pub(crate) fn warn_if_committed_late(
+    deadline: tokio::time::Instant,
+    taken: &Result<IntakeOutcome, DomainError>,
+    tenant_id: Uuid,
+    subject_id: Option<Uuid>,
+    record_key: &RecordKey,
+) {
+    let late = tokio::time::Instant::now().saturating_duration_since(deadline);
+    if !late.is_zero() && matches!(taken, Ok(IntakeOutcome::Received)) {
+        tracing::warn!(
+            %tenant_id,
+            subject_id = subject_id.map(|subject_id| subject_id.to_string()),
+            %record_key,
+            late_ms = u64::try_from(late.as_millis()).unwrap_or(u64::MAX),
+            "construct: a record's identity was committed after its receive window; an \
+             erasure of its subject may have missed it"
+        );
     }
 }

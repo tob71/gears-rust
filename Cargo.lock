@@ -2608,6 +2608,7 @@ dependencies = [
  "bytes",
  "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
+ "cf-gears-cluster-sdk",
  "cf-gears-construct-sdk",
  "cf-gears-graph-storage",
  "cf-gears-graph-storage-sdk",

@@ -240,7 +240,8 @@ deployment configuration.
 4. [ ] - `p1` - A fact candidate's plan loses every remove and replace step before the checks run, so a candidate
    only adds, whatever its claim made the model answer - `inst-process-candidate`
 5. [ ] - `p1` - The writer stores the admitted plan in one write that expects the profile version the plan was built
-   on - `inst-process-write`
+   on, awaited for at most 90 seconds; past that the write may still land, and the record is dropped as a failed
+   write. So every write ends within a bound an erasure can wait out - `inst-process-write`
 6. [ ] - `p1` - When the profile changed, the record is planned again on a new read of the profile, at most
    the given number of times. Past that, the record is dropped at the writer stage with `rerun_limit` -
    `inst-process-rerun`
@@ -255,8 +256,9 @@ deployment configuration.
 1. [ ] - `p1` - What a subject told an agent runs through the same chain as a record, under the caller's own security
    context and scope, and answers at once - `inst-manage-chain`
 2. [ ] - `p1` - A deadline bounds the steps before the write: the profile read, the agent loop, the checks and
-   Admission. Past it, nothing is stored and the answer is `timeout`. A write that started is awaited, so the answer
-   never says nothing was stored while the write lands - `inst-manage-deadline`
+   Admission. Past it, nothing is stored and the answer is `timeout`. A write that started is awaited for at most 90
+   seconds, so the answer never says nothing was stored while the write lands; past that the call is unavailable -
+   `inst-manage-deadline`
 3. [ ] - `p1` - A write conflict plans again on a new read while time is left, up to the rerun limit, then answers
    `rerun_limit` - `inst-manage-rerun`
 4. [ ] - `p1` - A stored plan answers what it changed, counted by its steps: added, replaced and removed. The writer
@@ -430,8 +432,8 @@ before the write at the deadline.
 
 **Verified by**: `what_a_subject_told_an_agent_is_written_and_counted`, `a_conflict_plans_the_message_again_on_a_new_read`,
 `a_call_that_stores_nothing_answers_why_and_sends_no_record_drop_event`,
-`the_deadline_cuts_off_the_steps_before_the_write`, `a_write_that_started_is_awaited_past_the_deadline` and
-`an_unreachable_profile_is_an_error`.
+`the_deadline_cuts_off_the_steps_before_the_write`, `a_write_that_started_is_awaited_past_the_deadline`,
+`a_write_that_never_ends_is_given_up_at_the_writer_limit` and `an_unreachable_profile_is_an_error`.
 
 ### Manage-Facts Route
 

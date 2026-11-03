@@ -9,13 +9,66 @@ use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
 use crate::domain::subject_settings::SubjectKey;
 
-/// The node key of a subject's profile root in its tenant.
+/// The node key of a subject's first profile root in its tenant, that of
+/// generation 0. Only tests use it: every read and write looks the
+/// generation up.
+#[cfg(test)]
 #[must_use]
 pub fn root_key(subject: &SubjectKey) -> NodeKey {
-    NodeKey(format!(
+    generation_root(subject, 0)
+}
+
+/// The node key of a subject's profile root in `generation`. Generation 0 has
+/// the key every profile had before erasure existed. An erasure soft-deletes
+/// the root and moves the generation on, because graph storage never gives a
+/// deleted key out again; the profile created after it gets the next key.
+///
+/// @cpt-dod:cpt-cf-construct-dod-erasure-root-key:p1
+#[must_use]
+pub fn generation_root(subject: &SubjectKey, generation: u64) -> NodeKey {
+    // @cpt-begin:cpt-cf-construct-algo-erasure-root-key:p1:inst-root-key
+    let first = format!(
         "construct:{}:root:{}",
         subject.tenant_id, subject.subject_id
-    ))
+    );
+    if generation == 0 {
+        NodeKey(first)
+    } else {
+        NodeKey(format!("{first}:{generation}"))
+    }
+    // @cpt-end:cpt-cf-construct-algo-erasure-root-key:p1:inst-root-key
+}
+
+/// The generation of `key` when it is a profile root key of `subject`, as
+/// [`generation_root`] builds it; none for any other key.
+#[must_use]
+pub fn root_generation(subject: &SubjectKey, key: &NodeKey) -> Option<u64> {
+    let first = generation_root(subject, 0);
+    let rest = key.0.strip_prefix(first.0.as_str())?;
+    if rest.is_empty() {
+        return Some(0);
+    }
+    // A key with a generation carries only digits, never 0 or a leading
+    // zero, so each generation has one key: `parse` alone takes a `+` too.
+    let generation = rest.strip_prefix(':')?;
+    if generation.starts_with('0') || !generation.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    generation.parse().ok()
+}
+
+/// [`ProfileGenerations`] where no subject was ever erased: every profile is
+/// in generation 0. For tests of the graph layer alone.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct FirstGeneration;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::domain::deletion::ProfileGenerations for FirstGeneration {
+    async fn generation(&self, _key: SubjectKey) -> Result<u64, DomainError> {
+        Ok(0)
+    }
 }
 
 /// The root's payload besides the version, which [`ProfileVersion`] owns.
@@ -34,6 +87,27 @@ pub struct Root {
 }
 
 impl Root {
+    /// The subject a stored root names, read through the root's own payload
+    /// type.
+    ///
+    /// # Errors
+    ///
+    /// When the payload is not a root's, a defect; the message names the
+    /// root.
+    pub fn subject_of(key: &NodeKey, payload: Option<&Value>) -> Result<Uuid, DomainError> {
+        let payload = payload.ok_or_else(|| {
+            DomainError::internal(format!("profile root {} has no payload", key.0))
+        })?;
+        RootPayload::<Vec<String>>::deserialize(payload)
+            .map(|parsed| parsed.subject_id)
+            .map_err(|err| {
+                DomainError::internal(format!(
+                    "profile root {} has no valid payload: {err}",
+                    key.0
+                ))
+            })
+    }
+
     /// Read the payload of `subject_id`'s stored root.
     ///
     /// # Errors

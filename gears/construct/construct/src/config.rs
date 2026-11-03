@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
@@ -49,6 +50,14 @@ pub struct ConstructConfig {
     /// constraint lets every category be read.
     #[serde(default)]
     pub profile_category_check: Option<CategoryCheckConfig>,
+    /// The tenants' retention periods, until Construct's settings are
+    /// declared in the settings service. Without one, data stays until it is
+    /// deleted.
+    #[serde(default)]
+    pub retention: RetentionConfig,
+    /// How erasures and the leader's deletion job run.
+    #[serde(default)]
+    pub deletion: DeletionConfig,
 }
 
 impl Default for ConstructConfig {
@@ -61,6 +70,41 @@ impl Default for ConstructConfig {
             processing: ProcessingConfig::default(),
             admission: AdmissionConfig::default(),
             profile_category_check: None,
+            retention: RetentionConfig::default(),
+            deletion: DeletionConfig::default(),
+        }
+    }
+}
+
+/// The retention periods, in days. A tenant listed in `tenants` has its own;
+/// every other has `default_days`, or none.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RetentionConfig {
+    /// The period of every tenant not listed; none keeps their data until it
+    /// is deleted.
+    pub default_days: Option<NonZeroU32>,
+    /// The period of each listed tenant, by tenant id.
+    pub tenants: BTreeMap<Uuid, NonZeroU32>,
+}
+
+/// How erasures and the leader's deletion job run.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DeletionConfig {
+    /// How often, in seconds, the cluster leader runs the erasures that
+    /// stopped and removes what is past the retention periods.
+    pub job_interval_secs: NonZeroU64,
+    /// The most erasures one instance runs the graph and table steps of at
+    /// once; any number wait out their marks meanwhile.
+    pub erasure_workers: NonZeroUsize,
+}
+
+impl Default for DeletionConfig {
+    fn default() -> Self {
+        Self {
+            job_interval_secs: NonZeroU64::new(300).unwrap_or(NonZeroU64::MIN),
+            erasure_workers: NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
         }
     }
 }
@@ -165,6 +209,12 @@ pub const MAX_WORKERS: usize = 256;
 pub const MAX_STEPS_LIMIT: usize = 10_000;
 /// The longest text piece the value cap may allow.
 pub const MAX_VALUE_CHARS_LIMIT: usize = 100_000;
+/// The longest retention period, in days: a hundred years.
+pub const MAX_RETENTION_DAYS: u32 = 36_500;
+/// The shortest and the longest interval of the deletion job, in seconds.
+pub const JOB_INTERVAL_SECS: std::ops::RangeInclusive<u64> = 10..=86_400;
+/// The most erasures one instance may run at once.
+pub const MAX_ERASURE_WORKERS: usize = 64;
 
 /// A config the gear refuses to start with.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -328,6 +378,42 @@ impl ConstructConfig {
             return Err(InvalidConfig(format!(
                 "model.model {:?} must be 1 to {MAX_MODEL_NAME_CHARS} printable characters with no space",
                 model.model
+            )));
+        }
+        self.check_deletion()
+    }
+
+    fn check_deletion(&self) -> Result<(), InvalidConfig> {
+        let retention = &self.retention;
+        if let Some(days) = retention.default_days
+            && days.get() > MAX_RETENTION_DAYS
+        {
+            return Err(InvalidConfig(format!(
+                "retention.default_days must be from 1 to {MAX_RETENTION_DAYS}, not {days}"
+            )));
+        }
+        if let Some((tenant, days)) = retention
+            .tenants
+            .iter()
+            .find(|(_, days)| days.get() > MAX_RETENTION_DAYS)
+        {
+            return Err(InvalidConfig(format!(
+                "retention.tenants.{tenant} must be from 1 to {MAX_RETENTION_DAYS} days, not {days}"
+            )));
+        }
+        let deletion = &self.deletion;
+        if !JOB_INTERVAL_SECS.contains(&deletion.job_interval_secs.get()) {
+            return Err(InvalidConfig(format!(
+                "deletion.job_interval_secs must be from {} to {}, not {}",
+                JOB_INTERVAL_SECS.start(),
+                JOB_INTERVAL_SECS.end(),
+                deletion.job_interval_secs
+            )));
+        }
+        if deletion.erasure_workers.get() > MAX_ERASURE_WORKERS {
+            return Err(InvalidConfig(format!(
+                "deletion.erasure_workers must be from 1 to {MAX_ERASURE_WORKERS}, not {}",
+                deletion.erasure_workers
             )));
         }
         Ok(())
@@ -706,5 +792,84 @@ mod tests {
             panic!("a category check without an identity is refused");
         };
         assert!(message.contains("processing_identity"), "{message}");
+    }
+
+    #[test]
+    fn retention_keeps_data_by_default_and_the_job_runs_every_five_minutes() {
+        let config = ConstructConfig::default();
+        assert_eq!(config.retention.default_days, None);
+        assert!(config.retention.tenants.is_empty());
+        assert_eq!(config.deletion.job_interval_secs.get(), 300);
+        assert_eq!(config.deletion.erasure_workers.get(), 4);
+    }
+
+    #[test]
+    fn the_retention_and_deletion_keys_are_read() {
+        let tenant = "8b0b4c4e-0000-4000-8000-000000000002";
+        let config = parse(serde_json::json!({
+            "retention": { "default_days": 365, "tenants": { tenant: 30 } },
+            "deletion": { "job_interval_secs": 60, "erasure_workers": 2 },
+        }))
+        .expect("known keys");
+        assert_eq!(
+            config.retention.default_days.map(NonZeroU32::get),
+            Some(365)
+        );
+        assert_eq!(
+            config
+                .retention
+                .tenants
+                .get(&Uuid::parse_str(tenant).unwrap())
+                .map(|days| days.get()),
+            Some(30)
+        );
+        assert_eq!(config.deletion.job_interval_secs.get(), 60);
+        assert_eq!(config.deletion.erasure_workers.get(), 2);
+    }
+
+    #[test]
+    fn a_retention_or_deletion_value_out_of_range_is_refused() {
+        let tenant = "8b0b4c4e-0000-4000-8000-000000000002";
+        for (json, names) in [
+            (
+                serde_json::json!({ "retention": { "default_days": 36_501 } }),
+                "retention.default_days",
+            ),
+            (
+                serde_json::json!({ "retention": { "tenants": { tenant: 36_501 } } }),
+                "retention.tenants",
+            ),
+            (
+                serde_json::json!({ "deletion": { "job_interval_secs": 9 } }),
+                "deletion.job_interval_secs",
+            ),
+            (
+                serde_json::json!({ "deletion": { "erasure_workers": 65 } }),
+                "deletion.erasure_workers",
+            ),
+        ] {
+            let err = valid(json).expect_err(names);
+            assert!(err.0.contains(names), "{err}");
+        }
+        let err = valid(serde_json::json!({ "deletion": { "job_interval_secs": 86_401 } }))
+            .expect_err("above the longest interval");
+        assert!(err.0.contains("deletion.job_interval_secs"), "{err}");
+        for json in [
+            serde_json::json!({ "retention": { "default_days": 36_500 } }),
+            serde_json::json!({ "retention": { "tenants": { tenant: 36_500 } } }),
+            serde_json::json!({ "deletion": { "job_interval_secs": 10 } }),
+            serde_json::json!({ "deletion": { "job_interval_secs": 86_400 } }),
+            serde_json::json!({ "deletion": { "erasure_workers": 64 } }),
+        ] {
+            valid(json.clone()).unwrap_or_else(|err| panic!("{json} is valid: {err}"));
+        }
+        assert!(
+            parse(serde_json::json!({ "retention": { "default_days": 0 } })).is_err(),
+            "a period of no days is no period"
+        );
+        assert!(
+            parse(serde_json::json!({ "retention": { "tenants": { "acme": 30 } } })).is_err(),
+            "a tenant is named by its id"
+        );
     }
 }

@@ -20,17 +20,19 @@ use graph_storage_sdk::GraphStorageClientV1;
 
 use crate::api::rest::routes;
 use crate::api::rest::types::{
-    ConcreteAdminFacts, ConcreteIntake, ConcreteProfile, ConcreteReviewQueue, ConcreteSettings,
-    ConcreteSubjectControl,
+    ConcreteAdminFacts, ConcreteErasure, ConcreteIntake, ConcreteProfile, ConcreteReviewQueue,
+    ConcreteSettings, ConcreteSubjectControl,
 };
 use crate::config::ConstructConfig;
 use crate::domain::local_client::LocalClient;
 use crate::domain::record_intake::{IntakePorts, RecordIntakeService};
 use crate::domain::subject_settings::SubjectSettingsService;
 use crate::infra::connector_switch::ConfigConnectorSwitch;
+use crate::infra::deletion_job::{ClusterLeadership, DeletionJob, ErasureWorker, Leadership};
 use crate::infra::pipeline::{self, Worker};
 use crate::infra::processing_metrics::WorkerLoad;
 use crate::infra::record_types::RegistryRecordTypes;
+use crate::infra::storage::deletion_repo::DeletionTables;
 use crate::infra::storage::record_ids_repo::SeaOrmRecordIdRepository;
 use crate::infra::storage::review_requests_repo::ReviewRequestStore;
 use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository;
@@ -53,9 +55,27 @@ pub struct ConstructGear {
     subject_control: OnceLock<Arc<ConcreteSubjectControl>>,
     review_queue: OnceLock<Arc<ConcreteReviewQueue>>,
     admin_facts: OnceLock<Arc<ConcreteAdminFacts>>,
+    erasure: OnceLock<Arc<ConcreteErasure>>,
     /// The processing worker, until `start` takes it.
     worker: Mutex<Option<Worker>>,
     running: Mutex<Option<Running>>,
+    /// The erasure worker and the deletion job, until `start` takes them.
+    deletion: Mutex<Option<DeletionTasks>>,
+    /// The started erasure worker and deletion job.
+    deleting: Mutex<Option<Deleting>>,
+}
+
+/// What `start` runs for Deletion.
+struct DeletionTasks {
+    worker: ErasureWorker,
+    job: Arc<DeletionJob>,
+    leadership: Arc<dyn Leadership>,
+}
+
+/// The started erasure worker and deletion job, and their stop token.
+struct Deleting {
+    token: CancellationToken,
+    handles: Vec<(&'static str, JoinHandle<()>)>,
 }
 
 /// The started worker: its stop token, its task, and what it has on hand.
@@ -74,8 +94,11 @@ impl Default for ConstructGear {
             subject_control: OnceLock::new(),
             review_queue: OnceLock::new(),
             admin_facts: OnceLock::new(),
+            erasure: OnceLock::new(),
             worker: Mutex::new(None),
             running: Mutex::new(None),
+            deletion: Mutex::new(None),
+            deleting: Mutex::new(None),
         }
     }
 }
@@ -140,6 +163,7 @@ impl Gear for ConstructGear {
             graph,
             Arc::clone(&settings) as _,
             Arc::new(ReviewRequestStore::new(Arc::clone(&db))),
+            Arc::new(DeletionTables::new(Arc::clone(&db))),
             policy_enforcer.clone(),
         )
         .context("record processing")?;
@@ -161,7 +185,17 @@ impl Gear for ConstructGear {
         self.admin_facts
             .set(pipeline.admin_facts)
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        self.erasure
+            .set(pipeline.erasure)
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         *self.worker.lock() = pipeline.worker;
+        // @cpt-begin:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-tasks
+        *self.deletion.lock() = Some(DeletionTasks {
+            worker: pipeline.erasure_worker,
+            job: pipeline.deletion_job,
+            leadership: Arc::new(ClusterLeadership::new(Arc::clone(&hub))),
+        });
+        // @cpt-end:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-tasks
         let ports = IntakePorts {
             types,
             switch: Arc::new(ConfigConnectorSwitch::new(
@@ -240,7 +274,14 @@ impl toolkit::contracts::RestApiCapability for ConstructGear {
         let router = routes::register_routes(router, openapi, intake, settings, profile);
         let router = routes::register_subject_control_routes(router, openapi, subject_control);
         let router = routes::register_review_queue_routes(router, openapi, review_queue);
+        let erasure = self
+            .erasure
+            .get()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("Erasure not initialized"))?;
+
         let router = routes::register_admin_facts_routes(router, openapi, admin_facts);
+        let router = routes::register_erasure_routes(router, openapi, erasure);
         info!("Construct gear: REST routes registered");
         Ok(router)
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-rest
@@ -249,8 +290,31 @@ impl toolkit::contracts::RestApiCapability for ConstructGear {
 
 #[async_trait]
 impl RunnableCapability for ConstructGear {
-    /// Start processing received records, when processing is configured.
+    /// Start the erasure worker and the leader's deletion job, and the
+    /// processing of received records when it is configured.
     async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()> {
+        // @cpt-begin:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-start
+        let tasks = self.deletion.lock().take();
+        if let Some(DeletionTasks {
+            worker,
+            job,
+            leadership,
+        }) = tasks
+        {
+            let token = cancel.child_token();
+            let handles = vec![
+                ("erasure worker", tokio::spawn(worker.run(token.clone()))),
+                (
+                    "deletion job",
+                    tokio::spawn({
+                        let token = token.clone();
+                        async move { leadership.lead(job, token).await }
+                    }),
+                ),
+            ];
+            *self.deleting.lock() = Some(Deleting { token, handles });
+        }
+        // @cpt-end:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-start
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-start
         let worker = self.worker.lock().take();
         let Some(worker) = worker else {
@@ -273,6 +337,13 @@ impl RunnableCapability for ConstructGear {
     /// is lost, as the DESIGN says, and its identity stays, so a resend is a
     /// repeat. How many were lost is logged.
     async fn stop(&self, deadline: CancellationToken) -> anyhow::Result<()> {
+        // Erasures in flight stop with their mark set, and the deletion job
+        // stops where it is; the next run goes on from what is left.
+        let deleting = self.deleting.lock().take();
+        let deletion_failed = match deleting {
+            Some(deleting) => stop_deletion(deleting, &deadline).await,
+            None => None,
+        };
         let running = self.running.lock().take();
         if let Some(Running {
             token,
@@ -322,8 +393,52 @@ impl RunnableCapability for ConstructGear {
                     .context("construct record processing ended with an error"));
             }
         }
-        Ok(())
+        deletion_failed.map_or(Ok(()), Err)
     }
+}
+
+/// Cancel the erasure worker and the deletion job, wait for each until
+/// `deadline`, then abort it and wait [`ABORT_GRACE`] more. Each task that
+/// panicked or did not end is logged; the first is returned for the host.
+async fn stop_deletion(
+    Deleting { token, handles }: Deleting,
+    deadline: &CancellationToken,
+) -> Option<anyhow::Error> {
+    token.cancel();
+    let mut failed = None;
+    for (name, mut handle) in handles {
+        let result = tokio::select! {
+            biased;
+            result = &mut handle => result,
+            () = deadline.cancelled() => {
+                handle.abort();
+                if let Ok(result) = tokio::time::timeout(ABORT_GRACE, &mut handle).await {
+                    result
+                } else {
+                    warn!(task = name, "construct: a deletion task did not end after it was aborted");
+                    failed.get_or_insert_with(|| {
+                        anyhow::anyhow!("construct {name} did not end after it was aborted")
+                    });
+                    continue;
+                }
+            }
+        };
+        if let Err(err) = result
+            && !err.is_cancelled()
+        {
+            let err = task_failed(name, err);
+            failed.get_or_insert(err);
+        }
+    }
+    failed
+}
+
+/// Log a deletion task that ended with an error, and the error for the
+/// host. Logged here too: a processing stop that fails returns its own
+/// error, and this one would not reach the host.
+fn task_failed(name: &str, err: tokio::task::JoinError) -> anyhow::Error {
+    tracing::error!(task = name, error = %err, "construct: a deletion task ended with an error");
+    anyhow::Error::new(err).context(format!("construct {name} ended with an error"))
 }
 
 /// How long `stop` waits for an aborted worker to end.

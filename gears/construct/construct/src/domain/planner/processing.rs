@@ -6,13 +6,14 @@ use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
 
 use super::agent::{AgentMessage, Planner};
 use crate::domain::admission::{Admission, AdmissionOutcome};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, Plan};
 use crate::domain::profile::Profile;
+use crate::domain::profile_writes::WRITER_LIMIT;
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, ReceivedRecord,
 };
@@ -329,8 +330,6 @@ impl Processing {
             return Ok(Run::Done);
         }
         match self
-            .ports
-            .writer
             .write(ctx, &admitted)
             .await
             .map_err(|_| Failure::Write)?
@@ -342,8 +341,8 @@ impl Processing {
 
     /// Takes what a subject told an agent through the planner, the checks, Admission and the writer, under the
     /// caller's own context and scope. The deadline cuts off only the steps before the write: a write that started is
-    /// awaited, so the answer never says nothing changed while the write lands. A conflict plans again on a new read
-    /// while time is left, at most `max_reruns` times.
+    /// awaited for up to [`WRITER_LIMIT`], and past it the call is unavailable, so the answer never says nothing changed
+    /// while the write lands. A conflict plans again on a new read while time is left, at most `max_reruns` times.
     ///
     /// # Errors
     ///
@@ -365,7 +364,7 @@ impl Processing {
                 Prepared::Write(plan) => plan,
                 Prepared::Nothing(nothing) => return Ok(nothing_stored(message, nothing)),
             };
-            match self.ports.writer.write(ctx, &plan).await? {
+            match self.write(ctx, &plan).await? {
                 Written::Stored => return Ok(Managed::Stored(Changes::of(&plan))),
                 Written::Conflict => {}
             }
@@ -421,6 +420,20 @@ impl Processing {
 }
 
 impl Processing {
+    /// Write `plan`, awaiting the writer for at most [`WRITER_LIMIT`], so an
+    /// erasure that waits out every write admitted before its mark waits out
+    /// this one too. Past the limit the write may still land; the record is
+    /// dropped as unwritten, which the erasure's second removal covers.
+    async fn write(&self, ctx: &SecurityContext, plan: &Plan) -> Result<Written, DomainError> {
+        timeout(WRITER_LIMIT, self.ports.writer.write(ctx, plan))
+            .await
+            .unwrap_or_else(|_| {
+                Err(DomainError::Unavailable(format!(
+                    "the profile write did not end within {WRITER_LIMIT:?}; it may have landed"
+                )))
+            })
+    }
+
     /// Drops every step of `plan` that would change or remove a fact under an
     /// open review request, or add a property to it. The planner still sees
     /// the fact, so the model does not add it again. `construct` is

@@ -8,7 +8,9 @@ use uuid::Uuid;
 use construct_sdk::gts::PROFILE_ROOT_TYPE;
 
 use super::fact_test::view;
-use super::root::{PayloadCounter, ProfileVersion, Root, root_key};
+use super::root::{
+    PayloadCounter, ProfileVersion, Root, generation_root, root_generation, root_key,
+};
 use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
 use crate::domain::subject_settings::SubjectKey;
@@ -38,6 +40,47 @@ fn the_root_key_names_tenant_and_subject() {
             subject.tenant_id, subject.subject_id
         )
     );
+}
+
+#[test]
+fn a_root_key_reads_back_as_the_generation_it_was_built_for() {
+    let subject = SubjectKey {
+        tenant_id: Uuid::new_v4(),
+        subject_id: Uuid::new_v4(),
+    };
+    for generation in [0, 1, 7, u64::MAX] {
+        assert_eq!(
+            root_generation(&subject, &generation_root(&subject, generation)),
+            Some(generation)
+        );
+    }
+
+    let first = root_key(&subject).0;
+    let other_tenant = SubjectKey {
+        tenant_id: Uuid::new_v4(),
+        ..subject
+    };
+    let other_subject = SubjectKey {
+        subject_id: Uuid::new_v4(),
+        ..subject
+    };
+    for foreign in [
+        generation_root(&other_tenant, 0).0,
+        generation_root(&other_subject, 3).0,
+        format!("{first}:x"),
+        format!("{first}3"),
+        format!("{first}:0"),
+        format!("{first}:03"),
+        format!("{first}:+3"),
+        format!("{first}:3 "),
+        format!("{first}:"),
+    ] {
+        assert_eq!(
+            root_generation(&subject, &NodeKey(foreign.clone())),
+            None,
+            "{foreign}"
+        );
+    }
 }
 
 #[test]
@@ -140,4 +183,20 @@ fn a_root_without_a_readable_version_is_a_defect() {
             "{payload:?}: {message}"
         );
     }
+}
+
+#[test]
+fn a_root_names_its_subject_and_an_unreadable_one_says_why() {
+    let subject_id = uuid::Uuid::new_v4();
+    let key = NodeKey("construct:t:root:s".to_owned());
+    let payload = serde_json::json!({ "subject_id": subject_id, "removals": [] });
+    assert_eq!(Root::subject_of(&key, Some(&payload)).unwrap(), subject_id);
+
+    let err = Root::subject_of(&key, Some(&serde_json::json!({ "subject_id": "nope" })))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no valid payload"), "{err}");
+    assert!(err.contains("construct:t:root:s"), "{err}");
+    let err = Root::subject_of(&key, None).unwrap_err().to_string();
+    assert!(err.contains("has no payload"), "{err}");
 }

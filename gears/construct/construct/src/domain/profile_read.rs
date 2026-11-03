@@ -15,6 +15,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, ScopeConstraint, ScopeValue, SecurityContext, pep_properties};
 use uuid::Uuid;
 
+use super::deletion::{RetentionPeriods, period_start};
 use super::error::DomainError;
 use super::plan::NodeKey;
 use super::planner::processing::ProcessingContexts;
@@ -164,6 +165,7 @@ pub struct ProfileReadService {
     ports: ProfileReadPorts,
     policy_enforcer: PolicyEnforcer,
     check: CategoryCheck,
+    retention: Option<Arc<dyn RetentionPeriods>>,
 }
 
 /// The request for the profile of the subject at `key`, with the category
@@ -402,7 +404,18 @@ impl ProfileReadService {
             ports,
             policy_enforcer,
             check,
+            retention: None,
         }
+    }
+
+    /// Serve no fact stored before the tenant's retention period began, also
+    /// before the retention job removes it.
+    ///
+    /// @cpt-dod:cpt-cf-construct-dod-retention-hide:p2
+    #[must_use]
+    pub fn with_retention(mut self, retention: Arc<dyn RetentionPeriods>) -> Self {
+        self.retention = Some(retention);
+        self
     }
 
     /// The tenant a read is about: the one named, or else the caller's own.
@@ -588,6 +601,14 @@ impl ProfileReadService {
             .into_iter()
             .filter(|fact| !under_review.contains(&fact.node_key));
         // @cpt-end:cpt-cf-construct-algo-review-queue-hide:p1:inst-hide-filter
+        // @cpt-begin:cpt-cf-construct-algo-retention-hide:p2:inst-hide-expired
+        let period = match &self.retention {
+            Some(retention) => retention.period(key.tenant_id).await?,
+            None => None,
+        };
+        let kept_since = period.and_then(|period| period_start(OffsetDateTime::now_utc(), period));
+        let stored = stored.filter(|fact| kept_since.is_none_or(|since| fact.stored_at >= since));
+        // @cpt-end:cpt-cf-construct-algo-retention-hide:p2:inst-hide-expired
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
         let mut groups: Vec<CategoryFacts> = Category::ALL
             .into_iter()

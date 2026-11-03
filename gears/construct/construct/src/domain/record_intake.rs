@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
@@ -30,6 +31,19 @@ pub(crate) const RECORD_RESOURCE: ResourceType =
 
 pub(crate) mod actions {
     pub const SEND: &str = "send";
+}
+
+/// The longest a record takes from the read of its subject's settings to the
+/// insert of its identity, which the hand-off and the commit follow at once.
+/// Past it the record is not taken, so a record checked before an erasure's
+/// mark keeps its identity soon after this after the mark.
+pub const RECEIVE_WINDOW: Duration = Duration::from_secs(10);
+
+/// A record not taken within the receive window: nothing was kept.
+fn not_taken() -> DomainError {
+    DomainError::Unavailable(format!(
+        "the record was not taken within {RECEIVE_WINDOW:?}; nothing is kept, send it again"
+    ))
 }
 
 /// What intake answers for a record it takes. The crate owns this enum, so a
@@ -565,35 +579,59 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
         // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-authorize
 
         let envelope = self.check_record(&record).await?;
-        self.check_tenant_and_subject(ctx, &scope, tenant_id, connector, &envelope)
-            .await?;
-
+        // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-window
+        // From the read of the subject's settings to the insert of the
+        // identity, a record takes at most the receive window. The hand-off
+        // and the commit follow at once, so an erasure that waits several
+        // windows after its mark also finds this record's identity.
+        let deadline = tokio::time::Instant::now() + RECEIVE_WINDOW;
+        tokio::time::timeout_at(
+            deadline,
+            self.check_tenant_and_subject(ctx, &scope, tenant_id, connector, &envelope),
+        )
+        .await
+        .map_err(|_| not_taken())??;
         let received = ReceivedRecord {
             tenant_id,
             connector: connector.to_string(),
             envelope,
             record,
         };
-        self.take(scope, received).await
+        self.take(scope, received, deadline).await
+        // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-window
     }
 
     /// Insert the record's identity and hand the record off, in one
     /// transaction: a repeat changes nothing, and a hand-off that refuses the
-    /// record rolls the identity back.
+    /// record rolls the identity back. An insert that does not end by
+    /// `deadline` rolls back too, before the hand-off, so nothing is kept.
     async fn take(
         &self,
         scope: AccessScope,
         received: ReceivedRecord,
+        deadline: tokio::time::Instant,
     ) -> Result<IntakeOutcome, DomainError> {
         let ids = Arc::clone(&self.ids);
         let hand_off = Arc::clone(&self.ports.hand_off);
-        self.db
+        let tenant_id = received.tenant_id;
+        // Named in the late-commit warning, so the erasure to look at is known.
+        let (subject_id, record_key) = (
+            received.envelope.subject_id,
+            RecordId::of_record(&received).key,
+        );
+        let taken = self
+            .db
             .db()
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-insert
                     let id = RecordId::of_record(&received);
-                    let inserted = ids.insert(tx, &scope, id).await?;
+                    // Dropping the insert at the deadline is safe: it runs in
+                    // this transaction, which then rolls back, so a half-done
+                    // insert keeps nothing.
+                    let inserted = tokio::time::timeout_at(deadline, ids.insert(tx, &scope, id))
+                        .await
+                        .map_err(|_| not_taken())??;
                     // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-insert
                     match inserted {
                         // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-repeat
@@ -607,7 +645,21 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
                     }
                 })
             })
-            .await
+            .await;
+        // The commit is not bounded; one that ended past the deadline leaves
+        // less of an erasure's wait than it counts on, so it is reported.
+        let late = tokio::time::Instant::now().saturating_duration_since(deadline);
+        if !late.is_zero() && matches!(taken, Ok(IntakeOutcome::Received)) {
+            tracing::warn!(
+                %tenant_id,
+                subject_id = subject_id.map(|subject_id| subject_id.to_string()),
+                %record_key,
+                late_ms = u64::try_from(late.as_millis()).unwrap_or(u64::MAX),
+                "construct: a record's identity was committed after its receive window; an \
+                 erasure of its subject may have missed it"
+            );
+        }
+        taken
     }
 
     /// The record's own checks: no `id`, and its type and the types it derives
@@ -657,6 +709,8 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
 
     /// The tenant's and the subject's checks: the connector is on, and, for a
     /// record about a subject, personalization is on with no erasure under way.
+    // cancel-safe: it only reads the connector switch and the subject's
+    // settings, so the receive window can drop it at any point.
     async fn check_tenant_and_subject(
         &self,
         ctx: &SecurityContext,

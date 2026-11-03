@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use construct_sdk::gts::{HAS_FACT_TYPE, PROFILE_ROOT_TYPE};
+use futures::{TryStreamExt, stream};
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{EdgeSpec, IngestOptions, IngestOutcome, IngestRequest, NodeSpec};
 use time::OffsetDateTime;
@@ -16,11 +17,12 @@ use uuid::Uuid;
 
 use super::fact::fact_node;
 use super::reader::{MAX_FACTS, Stored, read_stored};
-use super::root::{ProfileVersion, Root, root_key};
+use super::root::{ProfileVersion, Root};
 use super::types::GraphTypes;
 use super::{
     CAS_CONFLICT, ContextSubject, DEFAULT_CALL_TIMEOUT, bounded, graph_error, subject_in_context,
 };
+use crate::domain::deletion::{ProfileGenerations, ProfileRoots, RootRemoval};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Plan};
 use crate::domain::planner::processing::{PlanWriter, Written};
@@ -111,6 +113,9 @@ pub struct WriterPorts {
     pub types: Arc<GraphTypes>,
     pub version: Arc<dyn ProfileVersion>,
     pub removal: Arc<dyn FactRemoval>,
+    /// Where each subject's profile generation is kept; the reader of the
+    /// same profiles takes the same source.
+    pub generations: Arc<dyn ProfileGenerations>,
 }
 
 /// [`PlanWriter`] over graph storage: one ingest per plan, with the root's
@@ -365,6 +370,12 @@ struct Batch {
     listed: BTreeSet<NodeKey>,
 }
 
+/// How many facts a root's removal deletes at once.
+const ROOT_DELETES: usize = 4;
+
+/// How many call timeouts all the deletes of a root's removal may take.
+const ROOT_DELETE_CALLS: u32 = 6;
+
 /// The removals the root still lists whose fact is live. One whose fact is
 /// gone is done and drops off the list. Only a live fact of this root is
 /// ever removed, so a key that is not one of its facts is never deleted.
@@ -405,7 +416,7 @@ fn batch(
     // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-pending
 
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-batch
-    let root = root_key(subject);
+    let root = stored.key.clone();
     let Changes {
         mut nodes,
         edges,
@@ -460,6 +471,7 @@ impl GraphPlanWriter {
         read_stored(
             self.ports.client.as_ref(),
             self.ports.version.as_ref(),
+            self.ports.generations.as_ref(),
             self.timeout,
             ctx,
             subject,
@@ -479,15 +491,16 @@ impl GraphPlanWriter {
         subject: &ContextSubject,
         expected: Option<u64>,
     ) -> Result<Written, DomainError> {
-        let now = self.read(ctx, subject).await?.version;
-        if now == expected {
+        let now = self.read(ctx, subject).await?;
+        if now.version == expected {
             return Err(DomainError::internal(format!(
                 "graph storage refused the write of profile root {} while its counter \
                  {expected:?} did not move: the root was written outside Construct, its key is \
                  held by a removed node, or a key a new fact claims is already held",
-                root_key(subject.key()).0
+                now.key.0
             )));
         }
+        let now = now.version;
         tracing::warn!(
             expected = ?expected,
             stored = ?now,
@@ -567,5 +580,57 @@ impl PlanWriter for GraphPlanWriter {
             }
             Written::Conflict => self.refused(ctx, &subject, expected).await,
         }
+    }
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-erasure-root:p1
+#[async_trait]
+impl ProfileRoots for GraphPlanWriter {
+    #[tracing::instrument(skip_all, fields(tenant_id = %key.tenant_id, subject_id = %key.subject_id))]
+    async fn remove_root(
+        &self,
+        ctx: &SecurityContext,
+        key: SubjectKey,
+    ) -> Result<RootRemoval, DomainError> {
+        // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-root
+        let subject = subject_in_context(ctx, key)?;
+        let stored = self.read(ctx, &subject).await?;
+        if stored.version.is_none() {
+            return Ok(RootRemoval::Gone);
+        }
+        // A fact the root does not list for removal is live: a write landed
+        // after the facts were removed, and they are removed again first.
+        let left = stored
+            .facts
+            .iter()
+            .filter(|node| !stored.root.removals.contains(node.node_key.as_str()))
+            .count();
+        if left > 0 {
+            return Ok(RootRemoval::FactsLeft(left));
+        }
+        // The root is the only record of the listed facts whose delete has
+        // not run, so every one of them is deleted before the root is: a few
+        // at once, and all within one bound, so a long list cannot hold the
+        // erasure. What is deleted stays deleted; the next run does the rest.
+        let listed = pending(&stored);
+        let deletes = stream::iter(listed.iter().map(Ok))
+            .try_for_each_concurrent(ROOT_DELETES, |key| self.ports.removal.remove(ctx, key));
+        let limit = self.timeout.saturating_mul(ROOT_DELETE_CALLS);
+        tokio::time::timeout(limit, deletes).await.map_err(|_| {
+            DomainError::Unavailable(format!(
+                "the {} facts profile root {} lists for removal were not deleted within \
+                     {limit:?}; the erasure runs again",
+                listed.len(),
+                stored.key.0
+            ))
+        })??;
+        bounded(
+            self.timeout,
+            &format!("removal of profile root {}", stored.key.0),
+            self.ports.client.delete_node(ctx, &stored.key.0),
+        )
+        .await?;
+        Ok(RootRemoval::Removed)
+        // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-root
     }
 }

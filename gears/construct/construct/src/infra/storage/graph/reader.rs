@@ -6,13 +6,15 @@ use async_trait::async_trait;
 use construct_sdk::gts::{HAS_FACT_TYPE, PROFILE_ROOT_TYPE};
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{NodeView, TraverseRequest, TruncationReason};
+use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::fact::{fact_of, stored_fact_of};
-use super::root::{ProfileVersion, Root, root_key};
+use super::root::{ProfileVersion, Root, generation_root};
 use super::{ContextSubject, DEFAULT_CALL_TIMEOUT, graph_error, subject_in_context, unanswered};
+use crate::domain::deletion::{ProfileGenerations, RetentionPeriods, period_start};
 use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
 use crate::domain::planner::processing::ProfileSource;
@@ -39,6 +41,8 @@ const SNAPSHOT_TRIES: u32 = 3;
 /// none for a subject without a profile, and every live fact node, also those
 /// the root lists for removal whose soft delete has not run yet.
 pub(crate) struct Stored {
+    /// The key of the root, in the subject's current generation.
+    pub key: NodeKey,
     pub version: Option<u64>,
     pub root: Root,
     pub facts: Vec<NodeView>,
@@ -69,13 +73,16 @@ fn read_refused(err: &CanonicalError) -> DomainError {
 pub(crate) async fn read_stored(
     client: &dyn GraphStorageClientV1,
     versions: &dyn ProfileVersion,
+    generations: &dyn ProfileGenerations,
     timeout: Duration,
     ctx: &SecurityContext,
     subject: &ContextSubject,
 ) -> Result<Stored, DomainError> {
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-traverse
     let subject = subject.key();
-    let NodeKey(key) = root_key(subject);
+    // @cpt-begin:cpt-cf-construct-algo-erasure-root-key:p1:inst-root-read
+    let NodeKey(key) = generation_root(subject, generations.generation(*subject).await?);
+    // @cpt-end:cpt-cf-construct-algo-erasure-root-key:p1:inst-root-read
     let request = TraverseRequest {
         seeds: vec![key.clone()],
         depth: 1,
@@ -112,6 +119,7 @@ pub(crate) async fn read_stored(
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-root
     let Some(root_node) = response.nodes.iter().find(|node| node.node_key == key) else {
         return Ok(Stored {
+            key: NodeKey(key),
             version: None,
             root: Root::default(),
             facts: Vec::new(),
@@ -168,6 +176,7 @@ pub(crate) async fn read_stored(
         .filter(|node| pointed.contains(node.node_key.as_str()))
         .collect();
     Ok(Stored {
+        key: NodeKey(key),
         version: Some(version),
         root,
         facts,
@@ -182,17 +191,49 @@ pub(crate) async fn read_stored(
 pub struct GraphProfileSource {
     client: Arc<dyn GraphStorageClientV1>,
     version: Arc<dyn ProfileVersion>,
+    generations: Arc<dyn ProfileGenerations>,
+    retention: Option<Arc<dyn RetentionPeriods>>,
+    /// The time the retention period is counted back from.
+    clock: fn() -> OffsetDateTime,
     timeout: Duration,
 }
 
 impl GraphProfileSource {
+    /// A reader of each subject's profile in the generation `generations`
+    /// gives; the writer of the same profiles takes the same source.
     #[must_use]
-    pub fn new(client: Arc<dyn GraphStorageClientV1>, version: Arc<dyn ProfileVersion>) -> Self {
+    pub fn new(
+        client: Arc<dyn GraphStorageClientV1>,
+        version: Arc<dyn ProfileVersion>,
+        generations: Arc<dyn ProfileGenerations>,
+    ) -> Self {
         Self {
             client,
             version,
+            generations,
+            retention: None,
+            clock: OffsetDateTime::now_utc,
             timeout: DEFAULT_CALL_TIMEOUT,
         }
+    }
+
+    /// Count the retention period back from `clock` rather than the wall
+    /// clock, so a test decides exactly where the period starts.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_clock(mut self, clock: fn() -> OffsetDateTime) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Leave out of the planner's read every fact stored before the tenant's
+    /// retention period began, as the profile read does, so no plan is built
+    /// on an expired value. The subject's own view and the writes still see
+    /// such a fact until retention removes it.
+    #[must_use]
+    pub fn with_retention(mut self, retention: Arc<dyn RetentionPeriods>) -> Self {
+        self.retention = Some(retention);
+        self
     }
 
     /// Replace [`DEFAULT_CALL_TIMEOUT`] for the read.
@@ -222,6 +263,7 @@ impl ProfileSource for GraphProfileSource {
         let stored = read_stored(
             self.client.as_ref(),
             self.version.as_ref(),
+            self.generations.as_ref(),
             self.timeout,
             ctx,
             &subject,
@@ -230,10 +272,18 @@ impl ProfileSource for GraphProfileSource {
 
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-facts
         let listed = &stored.root.removals;
+        // @cpt-begin:cpt-cf-construct-algo-retention-hide:p2:inst-hide-expired
+        let period = match &self.retention {
+            Some(retention) => retention.period(tenant_id).await?,
+            None => None,
+        };
+        let kept_since = period.and_then(|period| period_start((self.clock)(), period));
+        // @cpt-end:cpt-cf-construct-algo-retention-hide:p2:inst-hide-expired
         let facts = stored
             .facts
             .iter()
             .filter(|node| !listed.contains(node.node_key.as_str()))
+            .filter(|node| kept_since.is_none_or(|since| node.envelope.created_at >= since))
             .map(fact_of)
             .collect::<Result<_, _>>()?;
         Ok(Profile {
@@ -258,6 +308,7 @@ impl StoredProfiles for GraphProfileSource {
         let stored = read_stored(
             self.client.as_ref(),
             self.version.as_ref(),
+            self.generations.as_ref(),
             self.timeout,
             ctx,
             &subject,
@@ -304,6 +355,7 @@ impl SubjectProfiles for GraphProfileSource {
         let stored = read_stored(
             self.client.as_ref(),
             self.version.as_ref(),
+            self.generations.as_ref(),
             self.timeout,
             ctx,
             &subject,

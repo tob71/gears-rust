@@ -727,3 +727,152 @@ async fn a_record_that_breaks_its_types_rules_beyond_the_schema_is_refused() {
     assert!(fixture.received().is_empty());
     assert_eq!(stored_record_ids(&db).await, 0);
 }
+
+#[tokio::test]
+async fn a_record_not_taken_within_the_receive_window_is_unavailable_and_keeps_nothing() {
+    let db = inmem_db().await;
+    // The database is connected; from here the clock moves only as the
+    // test's waits need.
+    tokio::time::pause();
+    let fixture = IntakeFixture {
+        tenant_default_delay: crate::domain::record_intake::RECEIVE_WINDOW
+            + std::time::Duration::from_secs(1),
+        ..IntakeFixture::default()
+    };
+    let intake = fixture.build(&db);
+
+    let err = intake
+        .submit(
+            &crate::test_support::context_in(Uuid::new_v4()),
+            Uuid::new_v4(),
+            chat_record(Uuid::new_v4(), "chat/t/1", "v1"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, DomainError::Unavailable(_)), "{err:?}");
+    tokio::time::resume();
+    assert_eq!(stored_record_ids(&db).await, 0, "no identity is kept");
+    assert!(fixture.received().is_empty(), "nothing is handed off");
+}
+
+/// The identity store, with each insert taking `.0` after its row is
+/// written, so only a rollback leaves nothing.
+struct SlowIds(Duration);
+
+#[async_trait::async_trait]
+impl crate::domain::record_intake::RecordIdRepository for SlowIds {
+    async fn insert<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &toolkit_security::AccessScope,
+        id: crate::domain::record_intake::RecordId,
+    ) -> Result<crate::domain::record_intake::IdInsert, DomainError> {
+        let inserted = crate::infra::storage::record_ids_repo::SeaOrmRecordIdRepository::new()
+            .insert(conn, scope, id)
+            .await;
+        tokio::time::sleep(self.0).await;
+        inserted
+    }
+}
+
+type SlowIntake = crate::domain::record_intake::RecordIntakeService<
+    SlowIds,
+    crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository,
+>;
+
+/// Intake whose tenant default takes `check` to read and whose identity
+/// insert takes `insert`, handing records to `hand_off`.
+fn slow_intake(
+    db: &toolkit_db::Db,
+    hand_off: &Arc<crate::test_support::RecordingHandOff>,
+    check: Duration,
+    insert: Duration,
+) -> SlowIntake {
+    use crate::domain::record_intake::{IntakePorts, RecordIntakeService};
+    use crate::domain::subject_settings::SubjectSettingsService;
+    use crate::infra::connector_switch::ConfigConnectorSwitch;
+    use crate::infra::record_types::RegistryRecordTypes;
+    use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository;
+
+    let provider = Arc::new(toolkit_db::DBProvider::new(db.clone()));
+    let enforcer =
+        authz_resolver_sdk::PolicyEnforcer::new(Arc::new(crate::test_support::AllowResolver));
+    RecordIntakeService::new(
+        Arc::clone(&provider),
+        Arc::new(SlowIds(insert)),
+        Arc::new(SubjectSettingsService::new(
+            provider,
+            Arc::new(SeaOrmSubjectSettingsRepository::new()),
+            Arc::new(crate::test_support::DelayedDefaults(true, check)),
+            enforcer.clone(),
+        )),
+        IntakePorts {
+            types: Arc::new(
+                RegistryRecordTypes::new(crate::test_support::hub_with_record_types()).unwrap(),
+            ),
+            switch: Arc::new(ConfigConnectorSwitch::new(Vec::new())),
+            hand_off: Arc::clone(hand_off) as _,
+        },
+        enforcer,
+    )
+}
+
+/// Submit one record with the clock paused after the database connected,
+/// so it moves only as the intake's waits need, and resume it after.
+async fn submit_paused(intake: &SlowIntake) -> Result<IntakeOutcome, DomainError> {
+    tokio::time::pause();
+    let submitted = intake
+        .submit(
+            &crate::test_support::context_in(Uuid::new_v4()),
+            Uuid::new_v4(),
+            chat_record(Uuid::new_v4(), "chat/t/1", "v1"),
+        )
+        .await;
+    tokio::time::resume();
+    submitted
+}
+
+#[tokio::test]
+async fn an_identity_insert_past_the_receive_window_is_rolled_back_before_the_hand_off() {
+    use crate::domain::record_intake::RECEIVE_WINDOW;
+
+    let db = inmem_db().await;
+    let hand_off = Arc::new(crate::test_support::RecordingHandOff::default());
+    let intake = slow_intake(
+        &db,
+        &hand_off,
+        Duration::ZERO,
+        RECEIVE_WINDOW + Duration::from_secs(1),
+    );
+
+    let err = submit_paused(&intake).await.unwrap_err();
+
+    assert!(matches!(err, DomainError::Unavailable(_)), "{err:?}");
+    assert_eq!(
+        stored_record_ids(&db).await,
+        0,
+        "the written identity is rolled back"
+    );
+    assert!(
+        hand_off.received.lock().unwrap().is_empty(),
+        "nothing is handed off"
+    );
+}
+
+#[tokio::test]
+async fn the_check_and_the_insert_share_one_receive_window() {
+    use crate::domain::record_intake::RECEIVE_WINDOW;
+
+    // Each phase alone fits in the window; together they do not.
+    let half = RECEIVE_WINDOW / 2 + Duration::from_secs(1);
+    let db = inmem_db().await;
+    let hand_off = Arc::new(crate::test_support::RecordingHandOff::default());
+    let intake = slow_intake(&db, &hand_off, half, half);
+
+    let err = submit_paused(&intake).await.unwrap_err();
+
+    assert!(matches!(err, DomainError::Unavailable(_)), "{err:?}");
+    assert_eq!(stored_record_ids(&db).await, 0, "nothing is kept");
+    assert!(hand_off.received.lock().unwrap().is_empty());
+}

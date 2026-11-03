@@ -3,6 +3,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -18,6 +19,8 @@ use uuid::Uuid;
 use crate::config::{CategoryCheckConfig, ValidConfig};
 use crate::domain::admin_facts::{AdminFactsPorts, AdminFactsService};
 use crate::domain::admission::{Admission, AdmissionPorts};
+use crate::domain::deletion::{Deletion, DeletionPorts};
+use crate::domain::erasure::ErasureService;
 use crate::domain::error::DomainError;
 use crate::domain::model_client::ModelClient;
 use crate::domain::one_step::OneStepPath;
@@ -38,6 +41,8 @@ use crate::domain::subject_settings::SubjectSettingsReader;
 use crate::infra::admin_facts_events::LogAdminFactsEvents;
 use crate::infra::admission_events::LogAdmissionEvents;
 use crate::infra::admission_rules::{ConfigAdmissionRules, warn_open_lists};
+use crate::infra::deletion_events::LogDeletionEvents;
+use crate::infra::deletion_job::{DeletionJob, ErasureWorker, erasure_queue};
 use crate::infra::intake_events::LogIntakeEvents;
 use crate::infra::model::chat_completions::{ChatCompletionsModel, ChatCompletionsSettings};
 use crate::infra::planner_stub::DroppingHandOff;
@@ -45,7 +50,10 @@ use crate::infra::processing_contexts::ServiceIdentity;
 use crate::infra::processing_metrics::{CountedDrops, ProcessingMetrics, WorkerLoad};
 use crate::infra::profile_events::LogProfileEvents;
 use crate::infra::record_queue::{RecordQueue, record_queue, serve};
+use crate::infra::retention_periods::ConfigRetentionPeriods;
 use crate::infra::review_queue_events::LogReviewQueueEvents;
+use crate::infra::storage::deletion_repo::DeletionTables;
+use crate::infra::storage::graph::directory::GraphProfileDirectory;
 use crate::infra::storage::graph::reader::GraphProfileSource;
 use crate::infra::storage::graph::root::PayloadCounter;
 use crate::infra::storage::graph::types::GraphTypes;
@@ -153,6 +161,11 @@ pub struct Pipeline {
     pub subject_control: Arc<SubjectControlService>,
     pub review_queue: Arc<ReviewQueueService>,
     pub admin_facts: Arc<AdminFactsService>,
+    pub erasure: Arc<ErasureService>,
+    /// Runs the erasures this instance takes.
+    pub erasure_worker: ErasureWorker,
+    /// The cluster leader's deletion job.
+    pub deletion_job: Arc<DeletionJob>,
 }
 
 /// Build the pipeline from the config.
@@ -173,6 +186,7 @@ pub fn build(
     graph: Arc<dyn GraphStorageClientV1>,
     settings: Arc<dyn SubjectSettingsReader>,
     reviews: Arc<dyn ReviewRequests>,
+    deletion: Arc<DeletionTables>,
     policy_enforcer: PolicyEnforcer,
 ) -> anyhow::Result<Pipeline> {
     let model: Option<Arc<dyn ModelClient>> = match &cfg.config().model {
@@ -186,7 +200,15 @@ pub fn build(
         )?)),
         None => None,
     };
-    assemble(cfg, model, graph, settings, reviews, policy_enforcer)
+    assemble(
+        cfg,
+        model,
+        graph,
+        settings,
+        reviews,
+        deletion,
+        policy_enforcer,
+    )
 }
 
 /// [`build`] with the model given, the seam a test uses for a scripted model.
@@ -200,6 +222,7 @@ pub fn assemble(
     graph: Arc<dyn GraphStorageClientV1>,
     settings: Arc<dyn SubjectSettingsReader>,
     reviews: Arc<dyn ReviewRequests>,
+    deletion: Arc<DeletionTables>,
     policy_enforcer: PolicyEnforcer,
 ) -> anyhow::Result<Pipeline> {
     let configured = Configured {
@@ -222,37 +245,52 @@ pub fn assemble(
     // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-read
     // Without an identity the read answers not configured at the identity, before
     // it reaches graph storage.
-    let reader = Arc::new(GraphProfileSource::new(
-        Arc::clone(&graph),
-        Arc::new(PayloadCounter),
-    ));
-    let profile = Arc::new(ProfileReadService::new(
-        ProfileReadPorts {
-            settings: Arc::clone(&settings),
-            profiles: Arc::clone(&reader) as _,
-            contexts: Arc::clone(&contexts),
-            events: Arc::new(LogProfileEvents),
-            reviews: Arc::clone(&reviews) as _,
-        },
-        policy_enforcer.clone(),
-        // Without an identity the read answers not configured before it
-        // checks a category, so the check it would take does not matter.
-        match cfg.identity().map(|identity| identity.category_check) {
-            Some(CategoryCheckConfig::OneCall) => CategoryCheck::OneCall,
-            Some(CategoryCheckConfig::PerCategory) | None => CategoryCheck::PerCategory,
-        },
-    ));
+    let periods = Arc::new(ConfigRetentionPeriods::new(cfg.config().retention.clone()));
+    // @cpt-begin:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-generations
+    // The reader and the writer find a profile's root in the generation the
+    // settings table keeps, which an erasure moves on. The planner reads no
+    // fact past the tenant's retention period.
+    let reader = Arc::new(
+        GraphProfileSource::new(
+            Arc::clone(&graph),
+            Arc::new(PayloadCounter),
+            Arc::clone(&deletion) as _,
+        )
+        .with_retention(Arc::clone(&periods) as _),
+    );
+    // @cpt-end:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-generations
+    let profile = Arc::new(
+        ProfileReadService::new(
+            ProfileReadPorts {
+                settings: Arc::clone(&settings),
+                profiles: Arc::clone(&reader) as _,
+                contexts: Arc::clone(&contexts),
+                events: Arc::new(LogProfileEvents),
+                reviews: Arc::clone(&reviews) as _,
+            },
+            policy_enforcer.clone(),
+            // Without an identity the read answers not configured before it
+            // checks a category, so the check it would take does not matter.
+            match cfg.identity().map(|identity| identity.category_check) {
+                Some(CategoryCheckConfig::OneCall) => CategoryCheck::OneCall,
+                Some(CategoryCheckConfig::PerCategory) | None => CategoryCheck::PerCategory,
+            },
+        )
+        .with_retention(Arc::clone(&periods) as _),
+    );
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-read
 
     // @cpt-begin:cpt-cf-construct-algo-subject-control-wire:p1:inst-wire-subject-control
     // The writer stores processing's plans and the subject's deletes, so a
     // subject deletes its facts also where no model is configured.
-    let writer: Arc<dyn PlanWriter> = Arc::new(GraphPlanWriter::new(WriterPorts {
+    let graph_writer = Arc::new(GraphPlanWriter::new(WriterPorts {
         client: Arc::clone(&graph),
         types: Arc::new(GraphTypes::new(Arc::clone(&graph))),
         version: Arc::new(PayloadCounter),
-        removal: Arc::new(SoftDelete::new(graph)),
+        removal: Arc::new(SoftDelete::new(Arc::clone(&graph))),
+        generations: Arc::clone(&deletion) as _,
     }));
+    let writer: Arc<dyn PlanWriter> = Arc::clone(&graph_writer) as _;
     let profile_writes = Arc::new(ProfileWrites::new(
         Arc::clone(&reader) as _,
         Arc::clone(&writer),
@@ -303,14 +341,44 @@ pub fn assemble(
     // a correction, under the same opt-in; a read and a delete need neither.
     let admin_facts = Arc::new(AdminFactsService::new(
         AdminFactsPorts {
-            writes: profile_writes,
+            writes: Arc::clone(&profile_writes),
             review_queue: Arc::clone(&review_queue),
             one_step,
             events: Arc::new(LogAdminFactsEvents),
         },
-        policy_enforcer,
+        policy_enforcer.clone(),
     ));
     // @cpt-end:cpt-cf-construct-algo-admin-facts-wire:p2:inst-wire-admin-facts
+
+    // @cpt-begin:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-deletion
+    // Erasure and retention run as Construct, so without a processing
+    // identity an erasure is marked, serves nothing, and stays marked until
+    // one is configured.
+    let deletion_events = Arc::new(LogDeletionEvents);
+    let runner = Arc::new(Deletion::new(DeletionPorts {
+        writes: profile_writes,
+        roots: graph_writer,
+        directory: Arc::new(GraphProfileDirectory::new(graph)),
+        store: Arc::clone(&deletion) as _,
+        reviews: Arc::clone(&reviews),
+        review_events: Arc::new(LogReviewQueueEvents),
+        events: Arc::clone(&deletion_events) as _,
+    }));
+    let (erasures, erasure_worker) =
+        erasure_queue(Arc::clone(&runner), cfg.config().deletion.erasure_workers);
+    let erasure = Arc::new(ErasureService::new(
+        Arc::clone(&deletion) as _,
+        Arc::new(erasures),
+        deletion_events,
+        policy_enforcer,
+    ));
+    let deletion_job = Arc::new(DeletionJob {
+        deletion: runner,
+        store: deletion,
+        periods,
+        interval: Duration::from_secs(cfg.config().deletion.job_interval_secs.get()),
+    });
+    // @cpt-end:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-deletion
 
     // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
     // No real sensitive-data check exists yet, so processing runs only where
@@ -325,6 +393,9 @@ pub fn assemble(
             subject_control,
             review_queue,
             admin_facts,
+            erasure,
+            erasure_worker,
+            deletion_job,
         });
     };
     let (hand_off, queue) = record_queue(cfg.config().processing.queue_capacity);
@@ -375,6 +446,9 @@ pub fn assemble(
         subject_control,
         review_queue,
         admin_facts,
+        erasure,
+        erasure_worker,
+        deletion_job,
     })
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
 }
@@ -480,6 +554,10 @@ impl Configured {
         if !identity {
             tracing::warn!(
                 "construct: the profile read answers 501, not configured, until processing_identity is set"
+            );
+            tracing::warn!(
+                "construct: an erasure is marked, and serves nothing, but is not run until \
+                 processing_identity is set"
             );
         }
     }

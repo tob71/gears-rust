@@ -38,6 +38,9 @@ bytes = { workspace = true }
 graph-storage-sdk = { workspace = true }
 graph-storage = { workspace = true }
 opentelemetry = { workspace = true }
+# The deletion job's leader election on the platform cluster gear. The SDK
+# only: no `deps = [cluster]` edge and no cluster gear dependency.
+cluster-sdk = { workspace = true }
 
 # Record types: the types registry resolves a record's type and base types
 types-registry-sdk = { workspace = true }
@@ -90,6 +93,7 @@ ignored = ["toolkit-odata-macros"]
 # needs no release of graph storage that has it.
 graph-storage = { package = "cf-gears-graph-storage", path = "../../graph-storage/graph-storage", features = ["test-support"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
+cluster-sdk = { workspace = true, features = ["test-util"] }
 toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 tower = { workspace = true, features = ["util"] }
 proptest = { workspace = true }

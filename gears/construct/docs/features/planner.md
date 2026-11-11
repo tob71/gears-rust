@@ -235,7 +235,8 @@ deployment configuration.
 2. [ ] - `p1` - Processing runs under the security context and the scope built for the record's tenant, never the
    connector's - `inst-process-context`
 3. [ ] - `p1` - Read the profile, run the agent loop, run the sensitive-data checks on the plan, and give the plan
-   and the verdicts to Admission. A plan without steps, or an admitted plan with every value blocked, stores nothing -
+   and the verdicts to Admission, which answers within the 20-second write budget or admits nothing, so the write
+   starts within the budget of the settings read that let it. A plan without steps, or an admitted plan with every value blocked, stores nothing -
    `inst-process-chain`
 4. [ ] - `p1` - A fact candidate's plan loses every remove and replace step before the checks run, so a candidate
    only adds, whatever its claim made the model answer - `inst-process-candidate`

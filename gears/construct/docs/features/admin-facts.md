@@ -140,7 +140,7 @@ The PRD requires that a tenant administrator can read all facts of any subject i
 **Steps**:
 1. [x] - `p2` - Caller sends `POST /construct/v1/admin/subjects/{subject_id}/facts` with `{property, value}`, authenticated - `inst-add-send`
 2. [x] - `p2` - API: the extractors take the security context, the service, the subject id and the body; a body without exactly one property answers 400 - `inst-add-parse`
-3. [x] - `p2` - Start the budget (20 seconds); it bounds every step before the write, from the permission check on, and past it the answer is unavailable with nothing written. Run `cpt-cf-construct-algo-admin-facts-admin-only`. **IF** the deployment did not opt in, not configured. Check the property and the value against the person types - `inst-add-authorize`
+3. [x] - `p2` - Start the budget (20 seconds); it bounds every step before the write, from the permission check on, and past it the answer is unavailable with nothing written. Run `cpt-cf-construct-algo-admin-facts-admin-only`. **IF** the deployment did not opt in, not configured. Check the property and the value against the person types. Note the tenant for retention (`cpt-cf-construct-feature-retention`): an add may be its only data outside graph storage - `inst-add-authorize`
 4. [x] - `p2` - Run `cpt-cf-construct-algo-review-queue-correct` for an add, with the administrator as origin: **IF** the subject holds the value, or a value of the one-valued property, already, **RETURN** held with that fact - `inst-add-write`
 5. [x] - `p2` - **IF** stored, record an added event and **RETURN** 201 with the fact; **IF** refused, record a refused event and answer with the reason - `inst-add-return`
 

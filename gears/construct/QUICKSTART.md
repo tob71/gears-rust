@@ -79,7 +79,7 @@ gears:
         # trusted_connectors: [...]  # connector identities as UUIDs; absent: every connector is trusted
         # entity_kinds: [...]        # absent: every entity kind is allowed
       profile_category_check: per_category   # required with processing_identity; one_call only for a policy plugin that answers with category constraints
-      retention:                     # all optional; absent: data is kept until it is deleted
+      retention: {}                  # all optional; empty: data is kept until it is deleted
         # default_days: 365          # the retention period of every tenant not listed
         # tenants: { "<tenant id>": 30 }  # a tenant's own period, in days
       deletion:                      # all optional

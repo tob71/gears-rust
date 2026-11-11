@@ -257,7 +257,7 @@ The system **MUST** keep each subject's profile generation and **MUST** read and
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-erasure-storage`
 
-The system **MUST** supply a migration, `m006_erasure_retention`, that adds to `construct__subject_settings` the column `profile_generation` (`BIGINT NOT NULL DEFAULT 0`) and the columns `erasure_marked_at` and `erasure_attempted_at` (nullable timestamps), to `construct__record_ids` the index `idx_construct__record_ids__received` on (`tenant_id`, `received_at`) for retention, and the table `construct__tenants` (`tenant_id` primary key, `first_seen`), the tenants Construct has held a row for, which retention keeps sweeping. A row stored before takes generation 0, no mark and no attempt. The migration **MUST** be safe to run twice. The store **MUST** clear the mark and the attempt, move the generation on and remove the subject's rows in one transaction, only while the mark is set, and **MUST** touch no other subject's rows.
+The system **MUST** supply a migration, `m006_erasure_retention`, that adds to `construct__subject_settings` the column `profile_generation` (`BIGINT NOT NULL DEFAULT 0`) and the columns `erasure_marked_at` and `erasure_attempted_at` (nullable timestamps), to `construct__record_ids` the index `idx_construct__record_ids__received` on (`tenant_id`, `received_at`) for retention, and the table `construct__tenants` (`tenant_id` primary key, `first_seen`), the tenants Construct has held a row for, which retention keeps sweeping. A row stored before takes generation 0, no mark and no attempt. The migration **MUST** be safe to run twice, and its step back **MUST** refuse while a subject was erased or is being erased, since it drops the generation and such a subject would read and write its removed root again. The store **MUST** clear the mark and the attempt, move the generation on and remove the subject's rows in one transaction, only while the mark is set, and **MUST** touch no other subject's rows.
 
 **Implements**:
 - `cpt-cf-construct-algo-erasure-erase`
@@ -266,7 +266,7 @@ The system **MUST** supply a migration, `m006_erasure_retention`, that adds to `
 **Touches**:
 - DB Tables: `construct__subject_settings`, `construct__review_requests`, `construct__record_ids`
 
-**Verified by**: `a_row_stored_before_takes_generation_zero_and_a_second_run_is_a_no_op` (migration), `the_finish_clears_the_mark_moves_the_generation_on_and_removes_only_the_subjects_rows`, `a_finish_without_a_mark_removes_nothing`, `the_stopped_erasures_are_those_marked_before_the_cut_of_any_tenant`, `an_erasure_marked_before_its_time_was_kept_counts_as_marked_long_ago`, `a_tenant_stays_known_after_retention_removed_its_rows` (store). The migration runs on `SQLite` in every test; the `MySQL` and `PostgreSQL` forms come from the schema builder and were not run.
+**Verified by**: `a_row_stored_before_takes_generation_zero_and_a_second_run_is_a_no_op`, `the_step_back_is_refused_once_a_subject_was_erased` (migration), `the_finish_clears_the_mark_moves_the_generation_on_and_removes_only_the_subjects_rows`, `a_finish_without_a_mark_removes_nothing`, `the_stopped_erasures_are_those_marked_before_the_cut_of_any_tenant`, `an_erasure_marked_before_its_time_was_kept_counts_as_marked_long_ago`, `a_tenant_stays_known_after_retention_removed_its_rows` (store). The migration runs on `SQLite` in every test; the `MySQL` and `PostgreSQL` forms come from the schema builder and were not run.
 
 ### Deletion's Events
 

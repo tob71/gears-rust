@@ -23,7 +23,7 @@ use crate::domain::deletion::{Deletion, DeletionStore, Erasure, RetentionPeriods
 use crate::domain::erasure::ErasureQueue;
 use crate::domain::error::DomainError;
 use crate::domain::subject_settings::SubjectKey;
-use crate::infra::pipeline::panic_message;
+use crate::infra::panics::panic_message;
 
 /// How many erasures wait for a worker on one instance; more are left to
 /// the leader's job.

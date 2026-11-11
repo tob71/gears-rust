@@ -10,6 +10,7 @@ pub mod deletion_job;
 mod hand_off_test;
 pub mod intake_events;
 pub mod model;
+pub(crate) mod panics;
 pub mod pipeline;
 #[cfg(test)]
 mod pipeline_test;

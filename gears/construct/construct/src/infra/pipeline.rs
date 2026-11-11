@@ -46,6 +46,7 @@ use crate::infra::deletion_events::LogDeletionEvents;
 use crate::infra::deletion_job::{DeletionJob, ErasureWorker, erasure_queue};
 use crate::infra::intake_events::LogIntakeEvents;
 use crate::infra::model::chat_completions::{ChatCompletionsModel, ChatCompletionsSettings};
+use crate::infra::panics::panic_message;
 use crate::infra::planner_stub::DroppingHandOff;
 use crate::infra::processing_contexts::ServiceIdentity;
 use crate::infra::processing_metrics::{CountedDrops, ProcessingMetrics, WorkerLoad};
@@ -511,15 +512,6 @@ fn warn_unchecked(cfg: &ValidConfig) {
          stored, from records and from reviewers' corrections"
     );
     warn_open_lists(&cfg.config().admission);
-}
-
-/// The message a panic was raised with, when it is a string.
-pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
-    panic
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("a panic without a message")
 }
 
 /// Whether the deployment has one of the processing's prerequisites.

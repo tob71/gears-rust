@@ -93,6 +93,33 @@ impl Tables {
             .unwrap();
     }
 
+    /// A request of `key`'s created at `created_at`, closed since.
+    async fn add_closed_request(&self, key: SubjectKey, created_at: OffsetDateTime) {
+        use crate::domain::review_queue::{Closed, ReviewOutcome};
+        self.add_request(key, created_at).await;
+        let open = self
+            .reviews
+            .of_subject(&tenant_scope(key), key)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.is_open() && request.created_at == created_at)
+            .expect("the request just opened");
+        let closed = Closed {
+            outcome: ReviewOutcome::Deleted,
+            by: Uuid::new_v4(),
+            at: OffsetDateTime::now_utc(),
+            reason: None,
+        };
+        assert!(
+            self.reviews
+                .close_open(&tenant_scope(key), open.key(), None, &closed)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     async fn requests(&self, key: SubjectKey) -> usize {
         self.reviews
             .of_subject(&tenant_scope(key), key)
@@ -379,9 +406,9 @@ async fn retention_removes_the_tenants_rows_from_before_the_cut_and_no_other() {
     let key = subject();
     let other = subject();
     let now = OffsetDateTime::now_utc();
-    t.add_request(key, now - Duration::days(40)).await;
-    t.add_request(key, now).await;
-    t.add_request(other, now - Duration::days(40)).await;
+    t.add_closed_request(key, now - Duration::days(40)).await;
+    t.add_closed_request(key, now).await;
+    t.add_closed_request(other, now - Duration::days(40)).await;
     t.add_identity(key).await;
     t.add_identity(other).await;
 
@@ -418,6 +445,27 @@ async fn retention_removes_the_tenants_rows_from_before_the_cut_and_no_other() {
     );
     assert_eq!(t.requests(other).await, 1, "another tenant keeps its rows");
     assert_eq!(t.identities().await, 1);
+}
+
+#[tokio::test]
+async fn retention_leaves_an_open_request_to_the_removal_of_its_fact() {
+    let t = tables().await;
+    let key = subject();
+    let now = OffsetDateTime::now_utc();
+    t.add_request(key, now - Duration::days(40)).await;
+
+    let removed = t
+        .store
+        .expire(&tenant_scope(key), key.tenant_id, now - Duration::days(30))
+        .await
+        .unwrap();
+
+    assert_eq!(removed.review_requests, 0);
+    assert_eq!(
+        t.requests(key).await,
+        1,
+        "the removal of its fact closes it, with its event; the next run removes it"
+    );
 }
 
 #[tokio::test]

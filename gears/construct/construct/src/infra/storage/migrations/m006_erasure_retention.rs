@@ -91,7 +91,32 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
+    /// Refused while a subject was erased or is being erased: the step back
+    /// drops the profile generation, and such a subject would read and write
+    /// its removed root again.
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        if manager.has_column(SETTINGS, GENERATION).await? {
+            let erased = Query::select()
+                .expr(Expr::col(Asterisk).count())
+                .from(Alias::new(SETTINGS))
+                .cond_where(
+                    Cond::any()
+                        .add(Expr::col(Alias::new(GENERATION)).gt(0))
+                        .add(Expr::col(Alias::new("erasure_in_progress")).eq(true)),
+                )
+                .to_owned();
+            let conn = manager.get_connection();
+            let erased: i64 = conn
+                .query_one_raw(conn.get_database_backend().build(&erased))
+                .await?
+                .map_or(Ok(0), |row| row.try_get_by_index(0))?;
+            if erased > 0 {
+                return Err(DbErr::Migration(format!(
+                    "{erased} subjects were erased or are being erased; stepping back \
+                     would lose their profile generation and serve their removed profile"
+                )));
+            }
+        }
         manager
             .drop_table(
                 Table::drop()
@@ -185,5 +210,46 @@ mod tests {
             .up(&manager)
             .await
             .expect("a second run is a no-op");
+    }
+
+    /// The step back drops the profile generation: refused once a subject
+    /// was erased, allowed while none was.
+    #[tokio::test]
+    async fn the_step_back_is_refused_once_a_subject_was_erased() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite connects");
+        Migrator::up(&db, None).await.expect("the upgrade");
+        let manager = sea_orm_migration::SchemaManager::new(&db);
+        db.execute_unprepared(&format!(
+            "INSERT INTO {SETTINGS} (tenant_id, subject_id, personalization_enabled, {GENERATION}) \
+             VALUES ('tenant-a', 'subject-a', 0, 1)"
+        ))
+        .await
+        .expect("an erased subject");
+
+        let refused = super::Migration.down(&manager).await.unwrap_err();
+        assert!(refused.to_string().contains("1 subjects"), "{refused}");
+        assert!(
+            manager
+                .has_column(SETTINGS, GENERATION)
+                .await
+                .expect("schema"),
+            "nothing was dropped"
+        );
+
+        db.execute_unprepared(&format!("UPDATE {SETTINGS} SET {GENERATION} = 0"))
+            .await
+            .expect("no subject erased");
+        super::Migration
+            .down(&manager)
+            .await
+            .expect("the step back while no subject was erased");
+        assert!(
+            !manager
+                .has_column(SETTINGS, GENERATION)
+                .await
+                .expect("schema")
+        );
     }
 }

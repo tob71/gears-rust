@@ -470,6 +470,7 @@ fn gear_deleting(leads: Leads) -> DeletingGear {
                 ),
             ),
             interval: std::time::Duration::from_secs(60),
+            retention_interval: std::time::Duration::from_secs(60),
         }),
         leadership: Arc::clone(&leadership) as _,
     });

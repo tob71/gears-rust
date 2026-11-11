@@ -449,6 +449,7 @@ impl Profiles {
             version: Arc::new(PayloadCounter),
             removal,
             generations: Arc::new(FirstGeneration),
+            tenants: Arc::new(crate::test_support::MemoryDeletionStore::default()),
         })
     }
 

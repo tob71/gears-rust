@@ -24,7 +24,7 @@ use super::types::GraphTypes;
 use super::{
     CAS_CONFLICT, ContextSubject, DEFAULT_CALL_TIMEOUT, bounded, graph_error, subject_in_context,
 };
-use crate::domain::deletion::{ProfileGenerations, ProfileRoots, RootRemoval};
+use crate::domain::deletion::{KnownTenants, ProfileGenerations, ProfileRoots, RootRemoval};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Plan};
 use crate::domain::planner::processing::{PlanWriter, Written};
@@ -118,6 +118,9 @@ pub struct WriterPorts {
     /// Where each subject's profile generation is kept; the reader of the
     /// same profiles takes the same source.
     pub generations: Arc<dyn ProfileGenerations>,
+    /// Where the writer notes a tenant when it creates a profile's root, so
+    /// retention sweeps a tenant whose only data is in graph storage.
+    pub tenants: Arc<dyn KnownTenants>,
 }
 
 /// [`PlanWriter`] over graph storage: one ingest per plan, with the root's
@@ -621,6 +624,11 @@ impl PlanWriter for GraphPlanWriter {
             return Ok(Written::Conflict);
         }
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-read-root
+        // A first write may be the tenant's only data: noted before the root
+        // exists, so retention sweeps whatever any caller stores.
+        if stored.version.is_none() {
+            by(deadline, self.ports.tenants.note(plan.tenant_id)).await?;
+        }
 
         let build = |stored: &Stored| {
             batch(

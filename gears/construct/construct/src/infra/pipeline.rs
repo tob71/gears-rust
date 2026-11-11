@@ -298,6 +298,7 @@ pub fn assemble(
         version: Arc::new(PayloadCounter),
         removal: Arc::new(SoftDelete::new(Arc::clone(&graph))),
         generations: Arc::clone(&deletion) as _,
+        tenants: Arc::clone(&deletion) as _,
     }));
     let writer: Arc<dyn PlanWriter> = Arc::clone(&graph_writer) as _;
     let profile_writes = Arc::new(ProfileWrites::new(
@@ -354,7 +355,6 @@ pub fn assemble(
             review_queue: Arc::clone(&review_queue),
             one_step,
             events: Arc::new(LogAdminFactsEvents),
-            tenants: Arc::clone(&deletion) as _,
         },
         policy_enforcer.clone(),
     ));
@@ -387,6 +387,9 @@ pub fn assemble(
         store: deletion,
         periods: Arc::clone(&periods) as _,
         interval: Duration::from_secs(cfg.config().deletion.job_interval_secs.get()),
+        retention_interval: Duration::from_secs(
+            cfg.config().deletion.retention_interval_secs.get(),
+        ),
     });
     // @cpt-end:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-deletion
 

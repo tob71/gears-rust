@@ -346,13 +346,16 @@ impl DeletionStore for DeletionTables {
     ) -> Result<ExpiredRows, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-retention-expire:p2:inst-expire-rows
         let conn = self.db.conn().map_err(DomainError::from)?;
+        // Only closed requests: an open one is closed by retention's removal
+        // of its fact, with its event, and goes on the next run.
         let review_requests = ReviewRequestEntity::delete_many()
             .secure()
             .scope_with(scope)
             .filter(
                 Condition::all()
                     .add(review_requests::Column::TenantId.eq(tenant_id))
-                    .add(review_requests::Column::CreatedAt.lt(before)),
+                    .add(review_requests::Column::CreatedAt.lt(before))
+                    .add(review_requests::Column::State.eq(super::review_requests_repo::CLOSED)),
             )
             .exec(&conn)
             .await

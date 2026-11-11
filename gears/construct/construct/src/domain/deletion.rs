@@ -139,8 +139,9 @@ pub trait DeletionStore: Send + Sync {
         limit: u64,
     ) -> Result<Vec<SubjectKey>, DomainError>;
 
-    /// Remove the tenant's review requests created before `before` and its
-    /// record identities received before it.
+    /// Remove the tenant's closed review requests created before `before`
+    /// and its record identities received before it. An open request stays
+    /// for retention's removal of its fact to close.
     async fn expire(
         &self,
         scope: &AccessScope,
@@ -153,8 +154,9 @@ pub trait DeletionStore: Send + Sync {
 }
 
 /// Where Construct notes the tenants it holds data for. Retention finds a
-/// tenant through Construct's own rows, and an administrator's add writes
-/// none: the add notes the tenant here, so its facts are swept too.
+/// tenant through Construct's own rows, and a profile an agent or an
+/// administrator wrote leaves none: the writer notes the tenant here when it
+/// creates a profile's root, so its facts are swept too.
 #[async_trait]
 pub trait KnownTenants: Send + Sync {
     /// Note `tenant_id`; noting it again changes nothing.
@@ -572,6 +574,7 @@ impl Deletion {
         before: OffsetDateTime,
         swept: &mut Swept,
     ) -> Result<(), DomainError> {
+        let mut seen = BTreeSet::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
             let page = self
@@ -594,9 +597,10 @@ impl Deletion {
                     cursor = None;
                     break;
                 }
-                // A listing that hands back the page it was asked for would
-                // keep the job on this tenant for good.
-                Some(next) if cursor.as_ref() == Some(&next) => {
+                // A listing that hands back a page it gave before, the one
+                // just asked for or an earlier one, would keep the job on this
+                // tenant until the page limit.
+                Some(next) if !seen.insert(next.clone()) => {
                     return Err(DomainError::internal(
                         "graph storage listed the same page of profile roots again; retention of \
                          the tenant stops for this run",

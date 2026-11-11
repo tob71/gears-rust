@@ -262,7 +262,11 @@ pub struct DeletionJob {
     pub deletion: Arc<Deletion>,
     pub store: Arc<dyn DeletionStore>,
     pub periods: Arc<dyn RetentionPeriods>,
+    /// How often the stopped erasures are run again.
     pub interval: Duration,
+    /// How often retention runs; periods are counted in days, so far less
+    /// often than the reruns.
+    pub retention_interval: Duration,
 }
 
 impl DeletionJob {
@@ -362,22 +366,23 @@ impl DeletionJob {
         tenants
     }
 
-    /// Run the job until `cancel` fires: the reruns of stopped erasures and
-    /// retention each in a loop of its own, every `interval`, so a long
-    /// retention sweep does not hold off a stopped erasure.
+    /// Run the job until `cancel` fires: the reruns of stopped erasures every
+    /// `interval` and retention every `retention_interval`, each in a loop of
+    /// its own, so a long retention sweep does not hold off a stopped
+    /// erasure.
     ///
     /// NOT cancel-safe for the runs in flight: they stop where they are, and
     /// the next leader's runs go on from what is left.
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) {
         tokio::join!(
-            self.every_interval(&cancel, || self.run_stopped_erasures()),
-            self.every_interval(&cancel, || self.run_retention()),
+            self.every_interval(&cancel, self.interval, || self.run_stopped_erasures()),
+            self.every_interval(&cancel, self.retention_interval, || self.run_retention()),
         );
     }
 
     /// Run `step` at once, then `interval` after each run ends, until
     /// `cancel` fires.
-    async fn every_interval<F, Fut>(&self, cancel: &CancellationToken, step: F)
+    async fn every_interval<F, Fut>(&self, cancel: &CancellationToken, interval: Duration, step: F)
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = ()>,
@@ -398,7 +403,7 @@ impl DeletionJob {
             }
             tokio::select! {
                 () = cancel.cancelled() => return,
-                () = tokio::time::sleep(self.interval) => {}
+                () = tokio::time::sleep(interval) => {}
             }
         }
     }
@@ -623,6 +628,7 @@ mod tests {
             store: Arc::clone(&job.store) as _,
             periods: periods(RetentionConfig::default()),
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         };
 
         runner.run_once().await;
@@ -647,6 +653,7 @@ mod tests {
                 tenants: [(job.key.tenant_id, days)].into(),
             }),
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         };
         listed_only.run_once().await;
         let swept: Vec<Uuid> = job
@@ -689,6 +696,7 @@ mod tests {
             store: Arc::clone(&job.store) as _,
             periods: periods(RetentionConfig::default()),
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         };
 
         runner.run_once().await;
@@ -834,6 +842,7 @@ mod tests {
                 tenants: [(other, days), (job.key.tenant_id, days)].into(),
             }),
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         };
 
         runner.run_once().await;
@@ -866,6 +875,7 @@ mod tests {
                 tenants: [(job.key.tenant_id, days)].into(),
             }),
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         };
 
         runner.run_once().await;
@@ -938,6 +948,7 @@ mod tests {
             store: Arc::clone(&job.store) as _,
             periods: periods(RetentionConfig::default()),
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         };
 
         runner.run_once().await;
@@ -1007,6 +1018,7 @@ mod tests {
                 tenants: [(first, days), (second, days)].into(),
             }),
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         };
 
         runner.run_once().await;
@@ -1060,6 +1072,7 @@ mod tests {
             store: Arc::clone(&job.store) as _,
             periods: Arc::clone(&periods) as _,
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         });
         let reads = || periods.reads.load(std::sync::atomic::Ordering::SeqCst);
         let cancel = CancellationToken::new();
@@ -1140,6 +1153,7 @@ mod tests {
                 tenants: [(job.key.tenant_id, days)].into(),
             }),
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         });
         let runs = || job.store.expired.lock().unwrap().len();
         let cancel = CancellationToken::new();
@@ -1158,6 +1172,35 @@ mod tests {
             .expect("the job ends when cancelled")
             .unwrap();
         assert_eq!(runs(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retention_runs_on_its_own_longer_interval() {
+        let job = job();
+        let days = NonZeroU32::new(30).unwrap();
+        let runner = Arc::new(DeletionJob {
+            deletion: Arc::clone(&job.deletion),
+            store: Arc::clone(&job.store) as _,
+            periods: periods(RetentionConfig {
+                default_days: None,
+                tenants: [(job.key.tenant_id, days)].into(),
+            }),
+            interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(600),
+        });
+        let sweeps = || job.store.expired.lock().unwrap().len();
+        let cancel = CancellationToken::new();
+        let running = tokio::spawn(Arc::clone(&runner).run(cancel.clone()));
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(sweeps(), 1, "the first sweep starts at once");
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(sweeps(), 1, "not on the reruns' interval");
+        tokio::time::sleep(Duration::from_secs(480)).await;
+        assert_eq!(sweeps(), 2);
+
+        cancel.cancel();
+        running.await.unwrap();
     }
 
     /// Retention periods whose read never ends, for a sweep that hangs.
@@ -1188,6 +1231,7 @@ mod tests {
             store: Arc::clone(&job.store) as _,
             periods: Arc::new(Hanging(job.key.tenant_id)),
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         });
         let cancel = CancellationToken::new();
         let running = tokio::spawn(Arc::clone(&runner).run(cancel.clone()));
@@ -1210,6 +1254,7 @@ mod tests {
             store: Arc::clone(&job.store) as _,
             periods: periods(RetentionConfig::default()),
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         });
         let leadership = ClusterLeadership::new(Arc::new(ClientHub::new()));
         let cancel = CancellationToken::new();
@@ -1294,6 +1339,7 @@ mod tests {
             store: Arc::clone(&job.store) as _,
             periods: periods(RetentionConfig::default()),
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         });
         let election = Arc::new(DrivenElection::default());
         let hub = ClientHub::new();
@@ -1353,6 +1399,7 @@ mod tests {
             store: Arc::clone(&job.store) as _,
             periods: periods(RetentionConfig::default()),
             interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
         };
 
         runner.run_once().await;

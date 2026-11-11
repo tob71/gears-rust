@@ -103,8 +103,12 @@ pub struct RetentionConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct DeletionConfig {
     /// How often, in seconds, the cluster leader runs the erasures that
-    /// stopped and removes what is past the retention periods.
+    /// stopped again.
     pub job_interval_secs: NonZeroU64,
+    /// How often, in seconds, the cluster leader removes what is past the
+    /// retention periods. Periods are counted in days, so far less often than
+    /// the reruns: each run reads every profile of every swept tenant.
+    pub retention_interval_secs: NonZeroU64,
     /// The most erasures one instance runs the graph and table steps of at
     /// once; any number wait out their marks meanwhile.
     pub erasure_workers: NonZeroUsize,
@@ -114,6 +118,7 @@ impl Default for DeletionConfig {
     fn default() -> Self {
         Self {
             job_interval_secs: NonZeroU64::new(300).unwrap_or(NonZeroU64::MIN),
+            retention_interval_secs: NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN),
             erasure_workers: NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
         }
     }
@@ -418,6 +423,14 @@ impl ConstructConfig {
                 JOB_INTERVAL_SECS.start(),
                 JOB_INTERVAL_SECS.end(),
                 deletion.job_interval_secs
+            )));
+        }
+        if !JOB_INTERVAL_SECS.contains(&deletion.retention_interval_secs.get()) {
+            return Err(InvalidConfig(format!(
+                "deletion.retention_interval_secs must be from {} to {}, not {}",
+                JOB_INTERVAL_SECS.start(),
+                JOB_INTERVAL_SECS.end(),
+                deletion.retention_interval_secs
             )));
         }
         if deletion.erasure_workers.get() > MAX_ERASURE_WORKERS {
@@ -810,6 +823,7 @@ mod tests {
         assert_eq!(config.retention.default_days, None);
         assert!(config.retention.tenants.is_empty());
         assert_eq!(config.deletion.job_interval_secs.get(), 300);
+        assert_eq!(config.deletion.retention_interval_secs.get(), 3600);
         assert_eq!(config.deletion.erasure_workers.get(), 4);
     }
 
@@ -832,7 +846,7 @@ mod tests {
         let tenant = "8b0b4c4e-0000-4000-8000-000000000002";
         let config = parse(serde_json::json!({
             "retention": { "default_days": 365, "tenants": { tenant: 30 } },
-            "deletion": { "job_interval_secs": 60, "erasure_workers": 2 },
+            "deletion": { "job_interval_secs": 60, "retention_interval_secs": 7200, "erasure_workers": 2 },
         }))
         .expect("known keys");
         assert_eq!(
@@ -848,6 +862,7 @@ mod tests {
             Some(30)
         );
         assert_eq!(config.deletion.job_interval_secs.get(), 60);
+        assert_eq!(config.deletion.retention_interval_secs.get(), 7200);
         assert_eq!(config.deletion.erasure_workers.get(), 2);
     }
 
@@ -866,6 +881,10 @@ mod tests {
             (
                 serde_json::json!({ "deletion": { "job_interval_secs": 9 } }),
                 "deletion.job_interval_secs",
+            ),
+            (
+                serde_json::json!({ "deletion": { "retention_interval_secs": 86_401 } }),
+                "deletion.retention_interval_secs",
             ),
             (
                 serde_json::json!({ "deletion": { "erasure_workers": 65 } }),

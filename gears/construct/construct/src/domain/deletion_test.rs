@@ -435,6 +435,35 @@ async fn a_listing_that_hands_back_the_same_page_stops_retention_of_the_tenant()
     );
 }
 
+#[tokio::test]
+async fn a_listing_that_comes_back_to_an_earlier_page_stops_retention_of_the_tenant() {
+    let fx = Fixture::new();
+    let page = |next: &str| SubjectsPage {
+        subjects: vec![Uuid::new_v4()],
+        next: Some(next.to_owned()),
+    };
+    let directory = FixedDirectory {
+        pages: vec![page("1"), page("2"), page("1"), page("2")],
+        ..FixedDirectory::default()
+    };
+
+    let err = fx
+        .deletion(directory)
+        .expire(fx.key.tenant_id, Duration::from_hours(24))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&err, DomainError::Internal(message) if message.contains("same page")),
+        "{err:?}"
+    );
+    assert_eq!(
+        fx.profile.reads.lock().unwrap().len(),
+        3,
+        "stopped where the listing came back, not at the page limit"
+    );
+}
+
 /// A listing whose every page names a next one.
 #[derive(Default)]
 struct EndlessDirectory {

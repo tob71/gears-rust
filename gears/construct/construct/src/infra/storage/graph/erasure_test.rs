@@ -64,6 +64,8 @@ struct Graph {
     client: Arc<dyn GraphStorageClientV1>,
     removal: Arc<FlakyRemoval>,
     generation: Arc<Generation>,
+    /// The tenants the writer noted.
+    tenants: Arc<crate::test_support::MemoryDeletionStore>,
     reader: GraphProfileSource,
     writer: GraphPlanWriter,
     directory: GraphProfileDirectory,
@@ -80,6 +82,7 @@ impl Graph {
             .context(key.tenant_id)
             .unwrap();
         let generation = Arc::new(Generation::default());
+        let tenants = Arc::new(crate::test_support::MemoryDeletionStore::default());
         let reader = GraphProfileSource::new(
             Arc::clone(&client),
             Arc::new(PayloadCounter),
@@ -97,6 +100,7 @@ impl Graph {
             version: Arc::new(PayloadCounter),
             removal: Arc::clone(&removal) as _,
             generations: Arc::clone(&generation) as _,
+            tenants: Arc::clone(&tenants) as _,
         });
         Self {
             key,
@@ -104,6 +108,7 @@ impl Graph {
             client: Arc::clone(&client),
             removal,
             generation,
+            tenants,
             reader,
             writer,
             directory: GraphProfileDirectory::new(client),
@@ -424,4 +429,24 @@ async fn the_planner_reads_no_fact_past_the_retention_period_while_the_subject_s
     );
     assert_eq!(planned.version, Some(2), "the version is the profile's");
     assert_eq!(own.facts.len(), 2, "until retention removes it");
+}
+
+#[tokio::test]
+async fn the_write_that_creates_a_profile_notes_its_tenant_for_retention() {
+    let graph = Graph::new();
+
+    graph.add_skill("Rust").await;
+    // A tenant whose only data is in graph storage, as an agent's manage
+    // call or an administrator's add leaves it, is still swept.
+    assert_eq!(
+        *graph.tenants.tenants.lock().unwrap(),
+        [graph.key.tenant_id].into()
+    );
+
+    graph.tenants.tenants.lock().unwrap().clear();
+    graph.add_skill("Go").await;
+    assert!(
+        graph.tenants.tenants.lock().unwrap().is_empty(),
+        "a write to an existing profile notes nothing again"
+    );
 }

@@ -566,6 +566,7 @@ async fn without_a_model_the_subject_still_deletes_its_facts() {
         version: Arc::new(PayloadCounter),
         removal: Arc::new(SoftDelete::new(Arc::clone(&graph))),
         generations: Arc::new(crate::infra::storage::graph::root::FirstGeneration),
+        tenants: Arc::new(crate::test_support::MemoryDeletionStore::default()),
     });
     assert_eq!(
         writer.write(&construct, &plan).await.unwrap(),

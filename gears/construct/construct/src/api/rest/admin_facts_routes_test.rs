@@ -102,6 +102,7 @@ impl Tenant {
                 review_queue,
                 one_step: Some(one_step),
                 events: Arc::default() as Arc<crate::test_support::RecordingAdminEvents>,
+                tenants: Arc::default() as Arc<crate::test_support::MemoryDeletionStore>,
             },
             enforcer,
         );

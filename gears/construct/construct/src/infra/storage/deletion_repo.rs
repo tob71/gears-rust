@@ -15,7 +15,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::DbProvider;
-use crate::domain::deletion::{DeletionStore, ExpiredRows, ProfileGenerations};
+use crate::domain::deletion::{DeletionStore, ExpiredRows, KnownTenants, ProfileGenerations};
 use crate::domain::error::DomainError;
 use crate::domain::subject_settings::{SettingsWrite, SubjectKey};
 
@@ -32,12 +32,54 @@ use super::tenants_entity::{self as tenants, Entity as TenantEntity};
 /// @cpt-dod:cpt-cf-construct-dod-erasure-storage:p1
 pub struct DeletionTables {
     db: Arc<DbProvider>,
+    /// The tenants this instance noted already, so an add notes each once.
+    noted: parking_lot::Mutex<BTreeSet<Uuid>>,
 }
 
 impl DeletionTables {
     #[must_use]
     pub fn new(db: Arc<DbProvider>) -> Self {
-        Self { db }
+        Self {
+            db,
+            noted: parking_lot::Mutex::default(),
+        }
+    }
+}
+
+/// Add `tenant_id` to `construct__tenants` unless it is there; another
+/// instance may add it at the same time.
+async fn insert_tenant(
+    conn: &impl DBRunner,
+    tenant_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<(), DomainError> {
+    let row = tenants::ActiveModel {
+        tenant_id: ActiveValue::Set(tenant_id),
+        first_seen: ActiveValue::Set(now),
+    };
+    match TenantEntity::insert(row.clone())
+        .secure()
+        .scope_with_model(&AccessScope::for_tenant(tenant_id), &row)
+        .map_err(map_scope_error)?
+        .exec(conn)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) if is_unique_violation(&err) => Ok(()),
+        Err(err) => Err(map_scope_error(err)),
+    }
+}
+
+#[async_trait]
+impl KnownTenants for DeletionTables {
+    async fn note(&self, tenant_id: Uuid) -> Result<(), DomainError> {
+        if self.noted.lock().contains(&tenant_id) {
+            return Ok(());
+        }
+        let conn = self.db.conn().map_err(DomainError::from)?;
+        insert_tenant(&conn, tenant_id, OffsetDateTime::now_utc()).await?;
+        self.noted.lock().insert(tenant_id);
+        Ok(())
     }
 }
 
@@ -159,8 +201,22 @@ impl DeletionStore for DeletionTables {
             }))
     }
 
-    async fn finish(&self, scope: &AccessScope, key: SubjectKey) -> Result<bool, DomainError> {
+    async fn finish(
+        &self,
+        scope: &AccessScope,
+        key: SubjectKey,
+        marked_at: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
         let scope = scope.clone();
+        // The erasure this run started: a mark kept without its time reads
+        // as the epoch, so that one matches a missing time too.
+        let same_mark = if marked_at == OffsetDateTime::UNIX_EPOCH {
+            Condition::any()
+                .add(settings::Column::ErasureMarkedAt.is_null())
+                .add(settings::Column::ErasureMarkedAt.eq(marked_at))
+        } else {
+            Condition::all().add(settings::Column::ErasureMarkedAt.eq(marked_at))
+        };
         DBProvider::<DomainError>::new(self.db.db())
             .transaction(move |tx| {
                 Box::pin(async move {
@@ -168,7 +224,11 @@ impl DeletionStore for DeletionTables {
                     let cleared = SubjectSettingsEntity::update_many()
                         .secure()
                         .scope_with(&scope)
-                        .filter(of_key(key).add(settings::Column::ErasureInProgress.eq(true)))
+                        .filter(
+                            of_key(key)
+                                .add(settings::Column::ErasureInProgress.eq(true))
+                                .add(same_mark),
+                        )
                         .col_expr(settings::Column::ErasureInProgress, Expr::value(false))
                         .col_expr(
                             settings::Column::ErasureMarkedAt,
@@ -410,21 +470,7 @@ impl DeletionStore for DeletionTables {
         // removed its rows; another instance may record it at the same time.
         let now = OffsetDateTime::now_utc();
         for tenant_id in tenants.difference(&known) {
-            let row = tenants::ActiveModel {
-                tenant_id: ActiveValue::Set(*tenant_id),
-                first_seen: ActiveValue::Set(now),
-            };
-            match TenantEntity::insert(row.clone())
-                .secure()
-                .scope_with_model(&AccessScope::for_tenant(*tenant_id), &row)
-                .map_err(map_scope_error)?
-                .exec(&conn)
-                .await
-            {
-                Ok(_) => {}
-                Err(err) if is_unique_violation(&err) => {}
-                Err(err) => return Err(map_scope_error(err)),
-            }
+            insert_tenant(&conn, *tenant_id, now).await?;
         }
         tenants.extend(known);
         Ok(tenants)

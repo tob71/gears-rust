@@ -53,11 +53,21 @@ pub struct ConstructConfig {
     /// The tenants' retention periods, until Construct's settings are
     /// declared in the settings service. Without one, data stays until it is
     /// deleted.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub retention: RetentionConfig,
     /// How erasures and the leader's deletion job run.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub deletion: DeletionConfig,
+}
+
+/// A section given with every key commented out is `null` in YAML; it means
+/// the defaults, as a section left out does.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl Default for ConstructConfig {
@@ -801,6 +811,20 @@ mod tests {
         assert!(config.retention.tenants.is_empty());
         assert_eq!(config.deletion.job_interval_secs.get(), 300);
         assert_eq!(config.deletion.erasure_workers.get(), 4);
+    }
+
+    #[test]
+    fn a_retention_or_deletion_section_without_a_key_takes_the_defaults() {
+        for section in [serde_json::Value::Null, serde_json::json!({})] {
+            let config = parse(serde_json::json!({
+                "retention": section.clone(),
+                "deletion": section.clone(),
+            }))
+            .unwrap_or_else(|err| panic!("{section}: {err}"));
+            assert_eq!(config.retention.default_days, None, "{section}");
+            assert!(config.retention.tenants.is_empty(), "{section}");
+            assert_eq!(config.deletion.job_interval_secs.get(), 300, "{section}");
+        }
     }
 
     #[test]

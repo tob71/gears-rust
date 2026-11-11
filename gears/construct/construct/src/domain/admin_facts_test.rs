@@ -79,6 +79,7 @@ struct Fixture {
     reviews: Arc<MemoryReviews>,
     events: Arc<RecordingAdminEvents>,
     review_events: Arc<RecordingReviewEvents>,
+    tenants: Arc<crate::test_support::MemoryDeletionStore>,
 }
 
 impl Fixture {
@@ -112,6 +113,7 @@ impl Fixture {
             reviews: Arc::default(),
             events: Arc::default(),
             review_events: Arc::default(),
+            tenants: Arc::default(),
         }
     }
 
@@ -160,6 +162,7 @@ impl Fixture {
                 review_queue,
                 one_step,
                 events: Arc::clone(&self.events) as _,
+                tenants: Arc::clone(&self.tenants) as _,
             },
             enforcer,
         )
@@ -396,6 +399,11 @@ async fn an_add_stores_a_new_fact_as_the_administrator() {
         .find(|fact| fact.node_key == added.node_key)
         .unwrap();
     assert_eq!(stored.origin, OriginKind::Administrator);
+    assert_eq!(
+        *fixture.tenants.tenants.lock().unwrap(),
+        [fixture.tenant].into(),
+        "the tenant is noted, so retention sweeps the fact"
+    );
     assert_eq!(
         fixture.events.taken(),
         [AdminFactsEvent::Added {

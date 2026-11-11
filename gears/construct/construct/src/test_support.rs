@@ -2005,6 +2005,14 @@ impl MemoryDeletionStore {
 }
 
 #[async_trait]
+impl crate::domain::deletion::KnownTenants for MemoryDeletionStore {
+    async fn note(&self, tenant_id: Uuid) -> Result<(), DomainError> {
+        self.tenants.lock().unwrap().insert(tenant_id);
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl crate::domain::deletion::DeletionStore for MemoryDeletionStore {
     async fn mark(
         &self,
@@ -2037,16 +2045,20 @@ impl crate::domain::deletion::DeletionStore for MemoryDeletionStore {
             .copied())
     }
 
-    async fn finish(&self, _scope: &AccessScope, key: SubjectKey) -> Result<bool, DomainError> {
+    async fn finish(
+        &self,
+        _scope: &AccessScope,
+        key: SubjectKey,
+        marked_at: time::OffsetDateTime,
+    ) -> Result<bool, DomainError> {
         if self.finish_lost.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(false);
         }
-        let removed = self
-            .marks
-            .lock()
-            .unwrap()
-            .remove(&(key.tenant_id, key.subject_id))
-            .is_some();
+        let removed = {
+            let mut marks = self.marks.lock().unwrap();
+            let id = (key.tenant_id, key.subject_id);
+            marks.get(&id) == Some(&marked_at) && marks.remove(&id).is_some()
+        };
         if removed {
             self.attempts
                 .lock()

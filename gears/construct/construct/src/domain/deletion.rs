@@ -116,8 +116,15 @@ pub trait DeletionStore: Send + Sync {
 
     /// In one transaction: remove the subject's review requests and record
     /// identities, move its profile generation on and clear the mark and the
-    /// last attempt. Only while the mark is set; whether it was.
-    async fn finish(&self, scope: &AccessScope, key: SubjectKey) -> Result<bool, DomainError>;
+    /// last attempt. Only while the erasure marked at `marked_at`, as
+    /// [`Self::marked`] gave it, is under way, so a run never finishes
+    /// another erasure; whether it was.
+    async fn finish(
+        &self,
+        scope: &AccessScope,
+        key: SubjectKey,
+        marked_at: OffsetDateTime,
+    ) -> Result<bool, DomainError>;
 
     /// Note that the leader's job tried the subject's erasure `at`, while
     /// one is under way.
@@ -143,6 +150,19 @@ pub trait DeletionStore: Send + Sync {
 
     /// The tenants Construct holds a row of its own for.
     async fn tenants(&self) -> Result<BTreeSet<Uuid>, DomainError>;
+}
+
+/// Where Construct notes the tenants it holds data for. Retention finds a
+/// tenant through Construct's own rows, and an administrator's add writes
+/// none: the add notes the tenant here, so its facts are swept too.
+#[async_trait]
+pub trait KnownTenants: Send + Sync {
+    /// Note `tenant_id`; noting it again changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot be reached.
+    async fn note(&self, tenant_id: Uuid) -> Result<(), DomainError>;
 }
 
 /// The tenants' retention periods. The period is a tenant setting in the
@@ -426,7 +446,10 @@ impl Deletion {
     ) -> Result<Erasure, DomainError> {
         {
             let _busy = permit(busy).await?;
-            self.clear_graph(construct, key).await?;
+            // The root stays until the wait is over: a write admitted before
+            // the mark can still attach a fact to it, and the removal after
+            // the wait finds that fact only through the root.
+            self.remove_every_fact(construct, key).await?;
         }
         // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-wait
         let wait = marked_at
@@ -440,10 +463,16 @@ impl Deletion {
         // it goes now, before the generation moves on and nothing looks at
         // this one again.
         let _busy = permit(busy).await?;
+        // Another run may have finished this erasure during the wait, and the
+        // subject started a new profile since: only the erasure this run
+        // started is cleared and finished.
+        if self.ports.store.marked(scope, key).await? != Some(marked_at) {
+            return Ok(Erasure::NotUnderWay);
+        }
         self.clear_graph(construct, key).await?;
         // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-wait
         // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-finish
-        if !self.ports.store.finish(scope, key).await? {
+        if !self.ports.store.finish(scope, key, marked_at).await? {
             return Ok(Erasure::NotUnderWay);
         }
         self.ports.events.record(DeletionEvent::Erased {
@@ -460,13 +489,7 @@ impl Deletion {
         construct: &SecurityContext,
         key: SubjectKey,
     ) -> Result<(), DomainError> {
-        // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-facts
-        let origin = Origin::Subject {
-            subject: key.subject_id,
-        };
-        self.remove_facts(construct, key, &origin, "erasure", |_| true)
-            .await?;
-        // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-facts
+        self.remove_every_fact(construct, key).await?;
         // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-root
         if let RootRemoval::FactsLeft(left) = self.ports.roots.remove_root(construct, key).await? {
             return Err(DomainError::Unavailable(format!(
@@ -477,6 +500,23 @@ impl Deletion {
         }
         Ok(())
         // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-root
+    }
+
+    /// Remove every live fact of the subject's current generation, keeping
+    /// its root.
+    async fn remove_every_fact(
+        &self,
+        construct: &SecurityContext,
+        key: SubjectKey,
+    ) -> Result<(), DomainError> {
+        // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-facts
+        let origin = Origin::Subject {
+            subject: key.subject_id,
+        };
+        self.remove_facts(construct, key, &origin, "erasure", |_| true)
+            .await?;
+        Ok(())
+        // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-facts
     }
 
     /// Remove what is past `period` in the tenant: its review requests and

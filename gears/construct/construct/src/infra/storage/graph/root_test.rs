@@ -140,19 +140,63 @@ fn a_new_subject_creates_its_root_at_version_one_and_every_write_adds_one() {
     assert_eq!(counter.next(None).unwrap(), 1);
     assert_eq!(counter.expected(Some(3)).unwrap(), 3);
     assert_eq!(counter.next(Some(3)).unwrap(), 4);
-    let max = u64::try_from(i64::MAX).unwrap();
-    assert_eq!(counter.expected(Some(max)).unwrap(), i64::MAX);
+}
+
+/// The version a root of `generation` with `counter` reads as.
+fn version_of(generation: u64, counter: u64) -> u64 {
+    let subject = SubjectKey {
+        tenant_id: Uuid::new_v4(),
+        subject_id: Uuid::new_v4(),
+    };
+    let mut root = view(
+        PROFILE_ROOT_TYPE,
+        Some(
+            json!({ "subject_id": subject.subject_id.to_string(), "version": counter, "removals": [] }),
+        ),
+    );
+    root.node_key = generation_root(&subject, generation).0;
+    PayloadCounter.read(&root).unwrap()
 }
 
 #[test]
-fn a_version_beyond_graph_storages_range_is_a_defect_not_a_conflict() {
+fn a_root_of_a_later_generation_never_reads_a_version_an_earlier_one_had() {
+    assert_eq!(
+        version_of(0, 1),
+        1,
+        "generation 0 reads its counter, as before"
+    );
+    assert_ne!(version_of(1, 1), version_of(0, 1));
+    assert_ne!(version_of(2, 1), version_of(1, 1));
+    assert!(version_of(1, 1) > version_of(0, u64::from(u32::MAX)));
+}
+
+#[test]
+fn graph_storage_sees_only_the_counter_and_a_write_advances_it_in_its_generation() {
     let counter = PayloadCounter;
-    let beyond = u64::try_from(i64::MAX).unwrap() + 1;
+    let version = version_of(3, 5);
 
-    let message = internal_message(counter.expected(Some(beyond)));
+    assert_eq!(counter.expected(Some(version)).unwrap(), 5);
+    let next = counter.next(Some(version)).unwrap();
+    assert_eq!(next, version_of(3, 6));
+    let mut payload = serde_json::Map::new();
+    counter.stamp(&mut payload, next);
+    assert_eq!(payload["version"], json!(6));
+}
 
-    assert!(message.contains(&beyond.to_string()), "{message}");
-    internal_message(counter.next(Some(u64::MAX)));
+#[test]
+fn a_counter_at_its_limit_cannot_advance_and_one_beyond_it_is_a_defect() {
+    let counter = PayloadCounter;
+    let last = version_of(1, u64::from(u32::MAX));
+
+    let message = internal_message(counter.next(Some(last)));
+    assert!(message.contains(&last.to_string()), "{message}");
+    let beyond = view(
+        PROFILE_ROOT_TYPE,
+        Some(
+            json!({ "subject_id": Uuid::new_v4().to_string(), "version": u64::from(u32::MAX) + 1, "removals": [] }),
+        ),
+    );
+    internal_message(PayloadCounter.read(&beyond));
 }
 
 #[test]

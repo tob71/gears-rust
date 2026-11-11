@@ -302,12 +302,32 @@ impl PlanWriter for Writer {
     }
 }
 
+/// The subject's settings, read after a delay.
+struct SlowSettings(std::time::Duration, SubjectSettings);
+
+#[async_trait]
+impl crate::domain::subject_settings::SubjectSettingsReader for SlowSettings {
+    async fn read(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        key: crate::domain::subject_settings::SubjectKey,
+    ) -> Result<SubjectSettings, DomainError> {
+        if !self.0.is_zero() {
+            tokio::time::sleep(self.0).await;
+        }
+        FixedSubjectSettings(Ok(self.1)).read(ctx, scope, key).await
+    }
+}
+
 pub(super) struct Chain {
     pub(super) contexts: bool,
     pub(super) profiles: Arc<Profiles>,
     pub(super) model: Arc<ScriptedModel>,
     pub(super) checks: Vec<Arc<dyn SensitiveDataCheck>>,
     pub(super) settings: SubjectSettings,
+    /// How long Admission's read of the subject's settings takes.
+    pub(super) settings_delay: std::time::Duration,
     pub(super) rules: Result<AdmissionRules, fn() -> DomainError>,
     pub(super) writer: Arc<Writer>,
     pub(super) events: Arc<RecordingEvents>,
@@ -326,6 +346,7 @@ impl Chain {
                 personalization_enabled: true,
                 erasure_in_progress: false,
             },
+            settings_delay: std::time::Duration::ZERO,
             rules: Ok(open_rules()),
             writer: Writer::answering(written),
             events,
@@ -365,7 +386,7 @@ impl Chain {
             ),
             SensitiveDataChecks::new(self.checks.clone(), Arc::clone(&events)),
             Admission::new(AdmissionPorts {
-                settings: Arc::new(FixedSubjectSettings(Ok(self.settings))),
+                settings: Arc::new(SlowSettings(self.settings_delay, self.settings)),
                 rules: Arc::new(FixedRules(self.rules.clone())),
                 events: Arc::new(RecordingAdmissionEvents::default()),
                 drops: Arc::clone(&events),

@@ -18,6 +18,7 @@ use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
 
+use super::deletion::KnownTenants;
 use super::error::DomainError;
 use super::one_step::{Gone, Held, NewFact, NotStored, OneStepDone, OneStepPath};
 use super::pagination::page;
@@ -101,6 +102,8 @@ pub struct AdminFactsPorts {
     /// storing values without sensitive-data checks.
     pub one_step: Option<Arc<OneStepPath>>,
     pub events: Arc<dyn AdminFactsEvents>,
+    /// Where an add notes its tenant, for retention.
+    pub tenants: Arc<dyn KnownTenants>,
 }
 
 /// A tenant administrator's read, add, edit and delete of a subject's
@@ -196,6 +199,10 @@ impl AdminFactsService {
             ProfileWrites::before_write(deadline, "add", self.administrator(ctx, subject_id))
                 .await?;
         let one_step = self.one_step()?;
+        // An add may be the tenant's only data outside graph storage: noted
+        // before the write, so retention sweeps whatever it stores.
+        ProfileWrites::before_write(deadline, "add", self.ports.tenants.note(key.tenant_id))
+            .await?;
         // @cpt-end:cpt-cf-construct-flow-admin-facts-add:p2:inst-add-authorize
         // @cpt-begin:cpt-cf-construct-flow-admin-facts-add:p2:inst-add-write
         let by = ctx.subject_id();

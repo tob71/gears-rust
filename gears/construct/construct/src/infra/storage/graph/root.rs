@@ -206,50 +206,84 @@ pub trait ProfileVersion: Send + Sync {
 /// The member of the root payload that holds the counter.
 const VERSION: &str = "version";
 
+/// The bits of a profile version below its root's generation: the counter.
+const COUNTER_BITS: u32 = 32;
+const COUNTER: u64 = (1 << COUNTER_BITS) - 1;
+
 /// [`ProfileVersion`] as a counter in the root's payload. Graph storage starts
 /// a node at version 1 and adds one on every write that changes it. The
 /// writer creates the root at 1 and adds one to the counter on every write,
 /// so every root write changes the node, and the counter is the stored
 /// version.
+///
+/// The version a read gives names the root's generation above the counter,
+/// so a root of a later generation never has the version a root of an
+/// earlier one had: a plan built before an erasure conflicts with the
+/// profile created after it, and is planned again. A root of generation 0
+/// has its counter as its version, as before erasure existed.
 #[derive(Debug, Default)]
 pub struct PayloadCounter;
 
+/// The generation a root key names: the part after the subject, none for
+/// generation 0.
+fn generation_of(root: &NodeView) -> Result<u64, DomainError> {
+    let Some(generation) = root.node_key.split(':').nth(4) else {
+        return Ok(0);
+    };
+    generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation <= COUNTER)
+        .ok_or_else(|| {
+            DomainError::internal(format!(
+                "profile root {} names no generation a version can carry",
+                root.node_key
+            ))
+        })
+}
+
 impl ProfileVersion for PayloadCounter {
     fn read(&self, root: &NodeView) -> Result<u64, DomainError> {
-        root.payload
+        let counter = root
+            .payload
             .as_ref()
             .and_then(|payload| payload[VERSION].as_u64())
+            .filter(|counter| *counter <= COUNTER)
             .ok_or_else(|| {
                 DomainError::internal(format!(
                     "profile root {} has no version counter",
                     root.node_key
                 ))
-            })
+            })?;
+        Ok((generation_of(root)? << COUNTER_BITS) | counter)
     }
 
     fn expected(&self, version: Option<u64>) -> Result<i64, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-expected
         // `Some(0)` claims a key no node holds: the root of a new subject is
         // created exactly once, also by two first writes at the same time.
-        version.map_or(Ok(0), |version| {
-            i64::try_from(version).map_err(|_| {
-                DomainError::internal(format!(
-                    "profile version {version} is beyond graph storage's node versions"
-                ))
-            })
-        })
+        // Graph storage's node version is the counter alone.
+        Ok(version.map_or(0, |version| i64::from(counter_of(version))))
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-expected
     }
 
     fn next(&self, version: Option<u64>) -> Result<u64, DomainError> {
         version.map_or(Ok(1), |version| {
-            version.checked_add(1).ok_or_else(|| {
-                DomainError::internal(format!("profile version {version} cannot advance"))
-            })
+            if u64::from(counter_of(version)) == COUNTER {
+                return Err(DomainError::internal(format!(
+                    "profile version {version} cannot advance"
+                )));
+            }
+            Ok(version + 1)
         })
     }
 
     fn stamp(&self, payload: &mut Map<String, Value>, version: u64) {
-        payload.insert(VERSION.to_owned(), Value::from(version));
+        payload.insert(VERSION.to_owned(), Value::from(counter_of(version)));
     }
+}
+
+/// The counter of a profile version, below its generation.
+fn counter_of(version: u64) -> u32 {
+    u32::try_from(version & COUNTER).unwrap_or(u32::MAX)
 }

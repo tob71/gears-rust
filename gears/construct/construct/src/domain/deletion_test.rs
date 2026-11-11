@@ -131,8 +131,8 @@ async fn an_erasure_removes_every_fact_and_the_root_then_finishes_and_says_so() 
     );
     assert_eq!(
         fx.roots.calls.load(Ordering::SeqCst),
-        2,
-        "the root is removed, and looked at again after the wait"
+        1,
+        "the root is removed once, after the wait"
     );
     assert_eq!(fx.store.finished(), [fx.key], "the tables are cleared last");
     assert!(!fx.store.is_marked(fx.key), "the mark is cleared");
@@ -216,8 +216,8 @@ async fn an_interrupted_erasure_completes_when_it_runs_again() {
     );
     assert_eq!(
         fx.roots.calls.load(Ordering::SeqCst),
-        3,
-        "once in the stopped run, twice in the next"
+        2,
+        "once in the stopped run, once in the next"
     );
     assert_eq!(fx.store.finished(), [fx.key]);
 }
@@ -867,6 +867,11 @@ async fn a_write_that_lands_during_the_wait_is_removed_before_the_erasure_finish
     });
     tokio::time::sleep(WINDOW / 3).await;
     assert!(fx.profile.live().is_empty());
+    assert_eq!(
+        fx.roots.calls.load(Ordering::SeqCst),
+        0,
+        "the root stays through the wait, so a fact a late write attaches to it is found"
+    );
 
     // A plan that passed Admission before the mark lands now.
     let late = stored_fact(Category::Skill, "skills", json!({ "name": "Go" }), 10);
@@ -877,4 +882,36 @@ async fn a_write_that_lands_during_the_wait_is_removed_before_the_erasure_finish
     assert!(fx.profile.live().is_empty(), "the late fact goes too");
     assert_eq!(fx.writer.plans().len(), 2);
     assert_eq!(fx.store.finished(), [fx.key]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_whose_erasure_another_run_finished_leaves_the_new_profile() {
+    use crate::domain::deletion::DeletionStore as _;
+
+    let fx = Fixture::new();
+    let marked = OffsetDateTime::now_utc();
+    fx.store.mark_at(fx.key, marked);
+    let deletion = Arc::new(fx.deletion(FixedDirectory::default()));
+    let running = tokio::spawn({
+        let deletion = Arc::clone(&deletion);
+        let key = fx.key;
+        async move { deletion.erase(key).await }
+    });
+    tokio::time::sleep(WINDOW / 3).await;
+    assert!(fx.profile.live().is_empty(), "the first removal ran");
+
+    // Another run of the same erasure finishes it during this run's wait,
+    // and the subject, with personalization on again, starts a new profile.
+    assert!(
+        fx.store
+            .finish(&toolkit_security::AccessScope::allow_all(), fx.key, marked)
+            .await
+            .unwrap()
+    );
+    let new = stored_fact(Category::Skill, "skills", json!({ "name": "Go" }), 10);
+    fx.profile.facts.lock().unwrap().push(new.clone());
+
+    assert_eq!(running.await.unwrap().unwrap(), Erasure::NotUnderWay);
+    assert_eq!(fx.profile.live(), [new], "the new profile stays");
+    assert_eq!(fx.writer.plans().len(), 1, "only the first removal wrote");
 }

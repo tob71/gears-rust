@@ -27,6 +27,20 @@ struct Tables {
     reviews: ReviewRequestStore,
 }
 
+/// Finish the erasure under way for `key`, as the run that read its mark.
+async fn finish_marked(t: &Tables, key: SubjectKey) -> bool {
+    let marked = t
+        .store
+        .marked(&tenant_scope(key), key)
+        .await
+        .unwrap()
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    t.store
+        .finish(&tenant_scope(key), key, marked)
+        .await
+        .unwrap()
+}
+
 async fn tables() -> Tables {
     let db = inmem_db().await;
     let provider = Arc::new(DBProvider::new(db.clone()));
@@ -204,7 +218,7 @@ async fn the_finish_clears_the_mark_moves_the_generation_on_and_removes_only_the
     t.add_identity(neighbour).await;
     t.store.mark(&tenant_scope(key), key, now).await.unwrap();
 
-    assert!(t.store.finish(&tenant_scope(key), key).await.unwrap());
+    assert!(finish_marked(&t, key).await);
 
     assert_eq!(t.requests(key).await, 0);
     assert_eq!(t.requests(neighbour).await, 1, "another subject keeps its");
@@ -226,13 +240,44 @@ async fn the_finish_clears_the_mark_moves_the_generation_on_and_removes_only_the
 }
 
 #[tokio::test]
+async fn a_finish_for_another_mark_leaves_the_erasure_under_way_and_removes_nothing() {
+    let t = tables().await;
+    let key = subject();
+    let now = OffsetDateTime::now_utc();
+    t.add_request(key, now).await;
+    t.add_identity(key).await;
+    t.store.mark(&tenant_scope(key), key, now).await.unwrap();
+
+    // A run of an earlier erasure, which another run already finished.
+    let earlier = now - Duration::minutes(10);
+    assert!(
+        !t.store
+            .finish(&tenant_scope(key), key, earlier)
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(t.requests(key).await, 1);
+    assert_eq!(t.identities().await, 1);
+    assert_eq!(t.store.generation(key).await.unwrap(), 0);
+    assert!(
+        t.store
+            .marked(&tenant_scope(key), key)
+            .await
+            .unwrap()
+            .is_some(),
+        "the erasure under way stays marked"
+    );
+}
+
+#[tokio::test]
 async fn a_finish_without_a_mark_removes_nothing() {
     let t = tables().await;
     let key = subject();
     t.add_request(key, OffsetDateTime::now_utc()).await;
     t.add_identity(key).await;
 
-    assert!(!t.store.finish(&tenant_scope(key), key).await.unwrap());
+    assert!(!finish_marked(&t, key).await);
 
     assert_eq!(t.requests(key).await, 1);
     assert_eq!(t.identities().await, 1);
@@ -248,7 +293,7 @@ async fn each_erasure_moves_the_generation_on_once_more() {
             .mark(&tenant_scope(key), key, OffsetDateTime::now_utc())
             .await
             .unwrap();
-        assert!(t.store.finish(&tenant_scope(key), key).await.unwrap());
+        assert!(finish_marked(&t, key).await);
         assert_eq!(t.store.generation(key).await.unwrap(), expected);
     }
 }
@@ -266,7 +311,7 @@ async fn the_stopped_erasures_are_those_marked_before_the_cut_of_any_tenant() {
     ] {
         t.store.mark(&tenant_scope(key), key, at).await.unwrap();
     }
-    t.store.finish(&tenant_scope(done), done).await.unwrap();
+    finish_marked(&t, done).await;
 
     let stopped = t
         .store
@@ -320,7 +365,7 @@ async fn a_tried_erasure_goes_behind_the_untried_and_a_finish_forgets_the_attemp
 
     // A finish clears the attempt with the mark, so a later erasure starts
     // in order of its own mark.
-    assert!(t.store.finish(&tenant_scope(tried), tried).await.unwrap());
+    assert!(finish_marked(&t, tried).await);
     t.store
         .mark(&tenant_scope(tried), tried, now - Duration::hours(3))
         .await
@@ -430,7 +475,7 @@ async fn the_generation_is_read_only_in_the_subjects_tenant() {
         .mark(&tenant_scope(key), key, OffsetDateTime::now_utc())
         .await
         .unwrap();
-    t.store.finish(&tenant_scope(key), key).await.unwrap();
+    finish_marked(&t, key).await;
     let elsewhere = SubjectKey {
         tenant_id: Uuid::new_v4(),
         subject_id: key.subject_id,
@@ -512,4 +557,17 @@ async fn a_tenant_stays_known_after_retention_removed_its_rows() {
         t.store.tenants().await.unwrap().contains(&key.tenant_id),
         "its facts in graph storage are still swept"
     );
+}
+
+#[tokio::test]
+async fn a_noted_tenant_is_among_the_tenants_and_noting_it_again_changes_nothing() {
+    use crate::domain::deletion::KnownTenants as _;
+
+    let t = tables().await;
+    let tenant = Uuid::new_v4();
+
+    t.store.note(tenant).await.unwrap();
+    t.store.note(tenant).await.unwrap();
+
+    assert_eq!(t.store.tenants().await.unwrap(), [tenant].into());
 }

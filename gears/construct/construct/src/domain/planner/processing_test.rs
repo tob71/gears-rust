@@ -509,6 +509,48 @@ async fn a_write_that_started_is_awaited_past_the_deadline_before_the_write() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_record_admitted_on_a_settings_read_past_the_budget_is_not_written() {
+    use crate::domain::profile_writes::WRITE_BUDGET;
+
+    // An erasure waits out every write admitted before its mark, counting the
+    // budget from Admission's read; a read answered later admits nothing.
+    let chain = Chain {
+        settings_delay: WRITE_BUDGET + Duration::from_secs(1),
+        ..Chain::new(adding_rust(1), &[Ok(Written::Stored)])
+    };
+    let started = Instant::now();
+
+    chain.process(&record()).await;
+
+    assert_eq!(started.elapsed(), WRITE_BUDGET);
+    assert!(chain.writer.plans().is_empty(), "nothing is written");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_agents_plan_admitted_on_a_settings_read_past_the_budget_is_not_written() {
+    use crate::domain::profile_writes::WRITE_BUDGET;
+
+    let chain = Chain {
+        settings_delay: WRITE_BUDGET + Duration::from_secs(1),
+        ..Chain::new(adding_rust(1), &[Ok(Written::Stored)])
+    };
+
+    let now = Instant::now();
+    let answered = chain
+        .manage(ManageDeadlines {
+            before_write: now + WRITE_BUDGET * 3,
+            answer: now + WRITE_BUDGET * 4,
+        })
+        .await;
+
+    assert!(
+        matches!(answered, Err(DomainError::Unavailable(_))),
+        "{answered:?}"
+    );
+    assert!(chain.writer.plans().is_empty(), "nothing is written");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_records_write_that_never_ends_is_dropped_at_the_writer_limit() {
     let chain = Chain {
         writer: Arc::new(Writer {

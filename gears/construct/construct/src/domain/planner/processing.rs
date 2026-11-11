@@ -13,7 +13,7 @@ use crate::domain::admission::{Admission, AdmissionOutcome};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, Plan};
 use crate::domain::profile::Profile;
-use crate::domain::profile_writes::WRITER_LIMIT;
+use crate::domain::profile_writes::{WRITE_BUDGET, WRITER_LIMIT};
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, ReceivedRecord,
 };
@@ -348,7 +348,6 @@ impl Processing {
             return Ok(Run::Done);
         };
         let admitted = match self
-            .admission
             .admit(ctx, scope, plan, &verdicts)
             .await
             .map_err(|_| Failure::AdmissionRead)?
@@ -445,7 +444,7 @@ impl Processing {
                 DropReason::CheckFailed,
             )));
         };
-        let admitted = match self.admission.admit(ctx, scope, plan, &verdicts).await? {
+        let admitted = match self.admit(ctx, scope, plan, &verdicts).await? {
             AdmissionOutcome::Admitted(admitted) => admitted.plan,
             AdmissionOutcome::Dropped(reason) => {
                 return Ok(Prepared::Nothing(NothingStored::Dropped(reason)));
@@ -459,6 +458,30 @@ impl Processing {
 }
 
 impl Processing {
+    /// Admission, answered within [`WRITE_BUDGET`]. The write follows at
+    /// once, so a plan admitted on the subject's settings starts its write
+    /// within the budget of that read, as an erasure's wait counts on: a read
+    /// that answers later, possibly from before the erasure's mark, admits
+    /// nothing.
+    async fn admit(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        plan: Plan,
+        verdicts: &[crate::domain::sensitive_data::Verdict],
+    ) -> Result<AdmissionOutcome, DomainError> {
+        timeout(
+            WRITE_BUDGET,
+            self.admission.admit(ctx, scope, plan, verdicts),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(DomainError::Unavailable(format!(
+                "Admission did not answer within {WRITE_BUDGET:?}; nothing is written"
+            )))
+        })
+    }
+
     /// Write `plan`, awaiting the writer for at most [`WRITER_LIMIT`], so an
     /// erasure that waits out every write admitted before its mark waits out
     /// this one too. Past the limit the write may still land; the record is

@@ -354,6 +354,7 @@ pub fn assemble(
             review_queue: Arc::clone(&review_queue),
             one_step,
             events: Arc::new(LogAdminFactsEvents),
+            tenants: Arc::clone(&deletion) as _,
         },
         policy_enforcer.clone(),
     ));

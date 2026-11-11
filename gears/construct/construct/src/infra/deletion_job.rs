@@ -768,8 +768,8 @@ mod tests {
 
         assert_eq!(
             removed_roots(&job),
-            2,
-            "one run for both requests, before its wait and after it"
+            1,
+            "one run for both requests, which removes the root after its wait"
         );
         assert_eq!(job.store.finished(), [job.key]);
         cancel.cancel();
@@ -813,8 +813,8 @@ mod tests {
         assert_eq!(job.store.finished(), [fresh]);
         assert_eq!(
             removed_roots(&job),
-            2,
-            "only the fresh one's root, before its wait and after it"
+            1,
+            "only the fresh one's root, after its wait"
         );
         assert!(job.store.is_marked(job.key), "the leader's job runs it");
     }
@@ -1089,17 +1089,18 @@ mod tests {
         for key in &keys {
             queue.enqueue(*key);
         }
+        let started = || job.profile.reads.lock().unwrap().len();
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(
-            removed_roots(&job),
+            started(),
             QUEUE,
-            "each erasure looked at its root once and waits out its mark"
+            "each erasure read the profile once and waits out its mark"
         );
         let next = another_subject();
         job.store.mark_at(next, OffsetDateTime::now_utc());
         queue.enqueue(next);
         tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(removed_roots(&job), QUEUE, "the next waits for room");
+        assert_eq!(started(), QUEUE, "the next waits for room");
 
         tokio::time::sleep(ERASURE_WAIT * 2).await;
         assert!(

@@ -218,7 +218,24 @@ async fn the_root_goes_once_its_facts_are_gone_and_the_next_generation_starts_a_
     graph.generation.0.store(1, Ordering::SeqCst);
     graph.add_skill("Go").await;
     let again = graph.reader.facts(&graph.ctx, graph.key).await.unwrap();
-    assert_eq!(again.version, Some(1), "a new root, created at version 1");
+    assert_eq!(
+        again.version,
+        Some((1 << 32) | 1),
+        "a new root, created at counter 1 in generation 1"
+    );
+    // A plan built on the first root at its first version, before the
+    // erasure, does not pass for one built on the new root.
+    let stale = Plan {
+        tenant_id: graph.key.tenant_id,
+        subject_id: graph.key.subject_id,
+        profile_version: Some(1),
+        ..connector_plan(vec![add_value("skill", "skills", json!({ "name": "C" }))])
+    };
+    assert_eq!(
+        graph.writer.write(&graph.ctx, &stale).await.unwrap(),
+        Written::Conflict,
+        "planned again on the new profile"
+    );
     let [fact] = again.facts.as_slice() else {
         panic!("one fact in the new profile, got {:?}", again.facts);
     };

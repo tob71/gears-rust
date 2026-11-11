@@ -733,15 +733,14 @@ async fn a_record_that_breaks_its_types_rules_beyond_the_schema_is_refused() {
 #[tokio::test]
 async fn a_record_not_taken_within_the_receive_window_is_unavailable_and_keeps_nothing() {
     let db = inmem_db().await;
-    // The database is connected; from here the clock moves only as the
-    // test's waits need.
-    tokio::time::pause();
+    // On the real clock: a paused one can jump past the pool's timeouts while
+    // the database works on its own thread, and the pool's next in-memory
+    // connection is an empty database.
     let fixture = IntakeFixture {
-        tenant_default_delay: crate::domain::record_intake::RECEIVE_WINDOW
-            + std::time::Duration::from_secs(1),
+        tenant_default_delay: WINDOW + Duration::from_secs(1),
         ..IntakeFixture::default()
     };
-    let intake = fixture.build(&db);
+    let intake = fixture.build(&db).with_receive_window(WINDOW);
 
     let err = intake
         .submit(
@@ -753,7 +752,6 @@ async fn a_record_not_taken_within_the_receive_window_is_unavailable_and_keeps_n
         .unwrap_err();
 
     assert!(matches!(err, DomainError::Unavailable(_)), "{err:?}");
-    tokio::time::resume();
     assert_eq!(stored_record_ids(&db).await, 0, "no identity is kept");
     assert!(fixture.received().is_empty(), "nothing is handed off");
 }

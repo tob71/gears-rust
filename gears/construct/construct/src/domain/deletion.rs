@@ -155,8 +155,8 @@ pub trait DeletionStore: Send + Sync {
 
 /// Where Construct notes the tenants it holds data for. Retention finds a
 /// tenant through Construct's own rows, and a profile an agent or an
-/// administrator wrote leaves none: the writer notes the tenant here when it
-/// creates a profile's root, so its facts are swept too.
+/// administrator wrote leaves none: the writer notes the tenant here on every
+/// write, so its facts are swept too.
 #[async_trait]
 pub trait KnownTenants: Send + Sync {
     /// Note `tenant_id`; noting it again changes nothing.

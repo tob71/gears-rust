@@ -432,7 +432,7 @@ async fn the_planner_reads_no_fact_past_the_retention_period_while_the_subject_s
 }
 
 #[tokio::test]
-async fn the_write_that_creates_a_profile_notes_its_tenant_for_retention() {
+async fn every_write_notes_its_tenant_for_retention() {
     let graph = Graph::new();
 
     graph.add_skill("Rust").await;
@@ -443,10 +443,13 @@ async fn the_write_that_creates_a_profile_notes_its_tenant_for_retention() {
         [graph.key.tenant_id].into()
     );
 
+    // A profile that existed before its tenant was noted, as one written
+    // before this release, has its tenant noted on its next write.
     graph.tenants.tenants.lock().unwrap().clear();
     graph.add_skill("Go").await;
-    assert!(
-        graph.tenants.tenants.lock().unwrap().is_empty(),
-        "a write to an existing profile notes nothing again"
+    assert_eq!(
+        *graph.tenants.tenants.lock().unwrap(),
+        [graph.key.tenant_id].into(),
+        "a write to an existing profile notes its tenant too"
     );
 }

@@ -118,7 +118,7 @@ pub struct WriterPorts {
     /// Where each subject's profile generation is kept; the reader of the
     /// same profiles takes the same source.
     pub generations: Arc<dyn ProfileGenerations>,
-    /// Where the writer notes a tenant when it creates a profile's root, so
+    /// Where the writer notes the tenant of every write, so
     /// retention sweeps a tenant whose only data is in graph storage.
     pub tenants: Arc<dyn KnownTenants>,
 }
@@ -624,11 +624,12 @@ impl PlanWriter for GraphPlanWriter {
             return Ok(Written::Conflict);
         }
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-read-root
-        // A first write may be the tenant's only data: noted before the root
-        // exists, so retention sweeps whatever any caller stores.
-        if stored.version.is_none() {
-            by(deadline, self.ports.tenants.note(plan.tenant_id)).await?;
-        }
+        // A profile may be the tenant's only data: every write notes the
+        // tenant before it stores, so retention sweeps whatever any caller
+        // stores, a profile created before tenants were noted included. The
+        // store keeps the tenants it noted, so this costs one insert per
+        // tenant and process.
+        by(deadline, self.ports.tenants.note(plan.tenant_id)).await?;
 
         let build = |stored: &Stored| {
             batch(

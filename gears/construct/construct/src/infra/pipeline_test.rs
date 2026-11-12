@@ -765,6 +765,7 @@ async fn an_erased_subject_is_served_nothing_at_once_keeps_only_its_setting_and_
     let worker = pipeline.worker.expect("processing is wired");
     let intake = IntakeFixture {
         hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
+        generations_from: Some(Arc::clone(&pipeline.generations)),
         ..IntakeFixture::default()
     }
     .build(&db);

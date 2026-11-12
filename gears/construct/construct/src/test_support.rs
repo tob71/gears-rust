@@ -374,6 +374,7 @@ pub fn received_chat_record(tenant_id: Uuid, subject_id: Uuid) -> ReceivedRecord
             observed_at: time::OffsetDateTime::UNIX_EPOCH,
         },
         record: chat_record(subject_id, provenance, "v1"),
+        generation: 0,
     }
 }
 
@@ -571,6 +572,10 @@ pub struct IntakeFixture {
     pub tenant_default_delay: std::time::Duration,
     /// The tenants' retention periods; none by default.
     pub retention: crate::config::RetentionConfig,
+    /// The subjects' profile generations; 0 by default.
+    pub generations: Arc<SharedGeneration>,
+    /// Read the generations here instead, such as the pipeline's store.
+    pub generations_from: Option<Arc<dyn crate::domain::deletion::ProfileGenerations>>,
 }
 
 impl Default for IntakeFixture {
@@ -589,6 +594,8 @@ impl Default for IntakeFixture {
             hand_off_to: None,
             tenant_default_delay: std::time::Duration::ZERO,
             retention: crate::config::RetentionConfig::default(),
+            generations: Arc::default(),
+            generations_from: None,
         }
     }
 }
@@ -635,6 +642,10 @@ impl IntakeFixture {
                         self.retention.clone(),
                     ),
                 ),
+                generations: self
+                    .generations_from
+                    .clone()
+                    .unwrap_or_else(|| Arc::clone(&self.generations) as _),
             },
             enforcer,
         )
@@ -2252,6 +2263,33 @@ pub fn deletion_over(store: Arc<MemoryDeletionStore>) -> Arc<crate::domain::dele
 }
 
 /// Retention periods with no period for any tenant: everything is kept.
+/// One profile generation for every subject, which a test moves on as an
+/// erasure would.
+#[derive(Default)]
+pub struct SharedGeneration(pub std::sync::atomic::AtomicU64);
+
+impl SharedGeneration {
+    /// Move the generation on, as an erasure's finish does.
+    pub fn erase(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::domain::deletion::ProfileGenerations for SharedGeneration {
+    async fn generation(
+        &self,
+        _key: crate::domain::subject_settings::SubjectKey,
+    ) -> Result<u64, DomainError> {
+        Ok(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// Generations no erasure moves on: every subject is in generation 0.
+pub fn no_erasure() -> Arc<dyn crate::domain::deletion::ProfileGenerations> {
+    Arc::new(SharedGeneration::default())
+}
+
 pub fn no_retention() -> Arc<dyn crate::domain::deletion::RetentionPeriods> {
     Arc::new(
         crate::infra::retention_periods::ConfigRetentionPeriods::new(

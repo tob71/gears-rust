@@ -66,6 +66,35 @@ async fn a_valid_record_is_received_handed_off_and_its_identity_kept() {
     assert_eq!(stored_record_ids(&db).await, 1);
 }
 
+/// A taken record carries its subject's profile generation, so processing
+/// can drop it once an erasure moved the generation on.
+#[tokio::test]
+async fn a_taken_record_carries_its_subjects_generation() {
+    let db = inmem_db().await;
+    let fixture = IntakeFixture::default();
+    fixture.generations.erase();
+    fixture.generations.erase();
+    let intake = fixture.build(&db);
+
+    intake
+        .submit(
+            &connector(),
+            Uuid::new_v4(),
+            chat_record(Uuid::new_v4(), "chat/t/1", "v1"),
+        )
+        .await
+        .expect("submit");
+
+    let received = fixture.received();
+    assert_eq!(
+        received
+            .iter()
+            .map(|record| record.generation)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+}
+
 #[tokio::test]
 async fn the_same_identity_again_is_a_repeat_and_changes_nothing() {
     let db = inmem_db().await;
@@ -563,6 +592,7 @@ async fn a_hand_off_that_refuses_leaves_no_identity_so_the_record_can_be_sent_ag
             )),
             hand_off: Arc::new(RefusingHandOff),
             retention: crate::test_support::no_retention(),
+            generations: crate::test_support::no_erasure(),
         },
         authz_resolver_sdk::PolicyEnforcer::new(Arc::new(crate::test_support::AllowResolver)),
     );
@@ -825,6 +855,7 @@ fn slow_intake(
             switch: Arc::new(ConfigConnectorSwitch::new(Vec::new())),
             hand_off: Arc::clone(hand_off) as _,
             retention: crate::test_support::no_retention(),
+            generations: crate::test_support::no_erasure(),
         },
         enforcer,
     )

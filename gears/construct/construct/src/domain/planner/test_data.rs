@@ -332,6 +332,7 @@ pub(super) struct Chain {
     pub(super) writer: Arc<Writer>,
     pub(super) events: Arc<RecordingEvents>,
     pub(super) reviews: Arc<crate::test_support::MemoryReviews>,
+    pub(super) generations: Arc<crate::test_support::SharedGeneration>,
 }
 
 impl Chain {
@@ -351,6 +352,7 @@ impl Chain {
             writer: Writer::answering(written),
             events,
             reviews: Arc::default(),
+            generations: Arc::default(),
         }
     }
 
@@ -397,6 +399,7 @@ impl Chain {
                 writer: Arc::clone(&self.writer) as Arc<dyn PlanWriter>,
                 events,
                 reviews: Arc::clone(&self.reviews) as _,
+                generations: Arc::clone(&self.generations) as _,
             },
             2,
         )

@@ -49,6 +49,38 @@ async fn an_admitted_plan_is_written_once() {
     assert!(chain.events.taken().is_empty());
 }
 
+/// A record taken before an erasure and processed after it is dropped at
+/// Admission, though personalization is on again, and a record taken in the
+/// current generation is written.
+#[tokio::test]
+async fn a_record_taken_before_an_erasure_is_dropped_after_it_though_personalization_is_on() {
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+    chain.generations.erase();
+
+    chain.process(&record()).await;
+
+    assert!(chain.writer.plans().is_empty(), "nothing is written");
+    assert_eq!(
+        chain.events.taken(),
+        dropped(DropStage::Admission, DropReason::ErasedSinceTaken)
+    );
+
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+    chain.generations.erase();
+    let taken_after = ReceivedRecord {
+        generation: 1,
+        ..record()
+    };
+
+    chain.process(&taken_after).await;
+
+    assert_eq!(
+        chain.writer.plans().len(),
+        1,
+        "a record of the new generation is written"
+    );
+}
+
 #[tokio::test]
 async fn a_write_conflict_plans_again_on_a_new_read_of_the_profile() {
     let chain = Chain::new(

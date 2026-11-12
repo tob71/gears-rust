@@ -209,6 +209,7 @@ impl Gear for ConstructGear {
             )),
             hand_off: pipeline.hand_off,
             retention: pipeline.retention,
+            generations: pipeline.generations,
         };
         let intake = Arc::new(RecordIntakeService::new(
             db,

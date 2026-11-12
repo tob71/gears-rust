@@ -10,6 +10,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 
 use super::agent::{AgentMessage, Planner};
 use crate::domain::admission::{Admission, AdmissionOutcome};
+use crate::domain::deletion::ProfileGenerations;
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, Plan};
 use crate::domain::profile::Profile;
@@ -107,6 +108,9 @@ pub struct ProcessingPorts {
     pub writer: Arc<dyn PlanWriter>,
     pub events: Arc<dyn IntakeEvents>,
     pub reviews: Arc<dyn FactsUnderReview>,
+    /// The subjects' profile generations, against which a record's own is
+    /// checked.
+    pub generations: Arc<dyn ProfileGenerations>,
 }
 
 /// Takes one received record through the planner, the sensitive-data checks, Admission and the writer. A write
@@ -127,6 +131,7 @@ enum Failure {
     ProfileRead,
     ReviewRead,
     AdmissionRead,
+    ErasedSinceTaken,
     Write,
     RerunLimit,
 }
@@ -137,7 +142,7 @@ impl Failure {
             Self::NotPlanned | Self::NoContext | Self::ProfileRead | Self::ReviewRead => {
                 DropStage::Planner
             }
-            Self::AdmissionRead => DropStage::Admission,
+            Self::AdmissionRead | Self::ErasedSinceTaken => DropStage::Admission,
             Self::Write | Self::RerunLimit => DropStage::Writer,
         }
     }
@@ -146,13 +151,14 @@ impl Failure {
         match self {
             Self::RerunLimit => DropReason::RerunLimit,
             Self::NotPlanned => DropReason::NotPlanned,
+            Self::ErasedSinceTaken => DropReason::ErasedSinceTaken,
             _ => DropReason::ProcessingFailed,
         }
     }
 
     fn kind(self) -> &'static str {
         match self {
-            Self::NotPlanned | Self::RerunLimit => self.reason().name(),
+            Self::NotPlanned | Self::RerunLimit | Self::ErasedSinceTaken => self.reason().name(),
             Self::NoContext => "no_context",
             Self::ProfileRead => "profile_read_failed",
             Self::ReviewRead => "review_read_failed",
@@ -347,6 +353,25 @@ impl Processing {
         let Checked::Verdicts(verdicts) = self.checks.run(&plan).await else {
             return Ok(Run::Done);
         };
+        // @cpt-begin:cpt-cf-construct-algo-erasure-generation:p1:inst-generation-admit
+        // A record taken before an erasure is never stored after it: once the
+        // erasure moved the subject's generation on, the record is dropped,
+        // also when the subject turned personalization on again. An erasure
+        // marked after this read stops the write at Admission's settings read
+        // or waits it out.
+        let current = self
+            .ports
+            .generations
+            .generation(SubjectKey {
+                tenant_id: record.tenant_id,
+                subject_id,
+            })
+            .await
+            .map_err(|_| Failure::AdmissionRead)?;
+        if current > record.generation {
+            return Err(Failure::ErasedSinceTaken);
+        }
+        // @cpt-end:cpt-cf-construct-algo-erasure-generation:p1:inst-generation-admit
         let admitted = match self
             .admit(ctx, scope, plan, &verdicts)
             .await

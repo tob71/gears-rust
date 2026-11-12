@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::config::{CategoryCheckConfig, ValidConfig};
 use crate::domain::admin_facts::{AdminFactsPorts, AdminFactsService};
 use crate::domain::admission::{Admission, AdmissionPorts};
-use crate::domain::deletion::{Deletion, DeletionPorts, RetentionPeriods};
+use crate::domain::deletion::{Deletion, DeletionPorts, ProfileGenerations, RetentionPeriods};
 use crate::domain::erasure::ErasureService;
 use crate::domain::error::DomainError;
 use crate::domain::model_client::ModelClient;
@@ -172,6 +172,8 @@ pub struct Pipeline {
     pub deletion_job: Arc<DeletionJob>,
     /// The tenants' retention periods, which intake checks a record against.
     pub retention: Arc<dyn RetentionPeriods>,
+    /// The subjects' profile generations, which a record intake takes carries.
+    pub generations: Arc<dyn ProfileGenerations>,
 }
 
 /// How long manage-facts may take: [`WRITE_BUDGET`] for the steps before the write, as the other write paths have,
@@ -239,15 +241,7 @@ pub fn assemble(
     deletion: Arc<DeletionTables>,
     policy_enforcer: PolicyEnforcer,
 ) -> anyhow::Result<Pipeline> {
-    let configured = Configured {
-        identity: Part::of(cfg.identity().as_ref()),
-        model: Part::of(model.as_ref()),
-        unchecked: if cfg.config().processing.run_without_sensitive_data_checks {
-            Part::Present
-        } else {
-            Part::Missing
-        },
-    };
+    let configured = Configured::of(cfg, model.as_ref());
     let identity = cfg
         .identity()
         .map(|identity| ServiceIdentity::new(identity.id));
@@ -385,7 +379,7 @@ pub fn assemble(
     ));
     let deletion_job = Arc::new(DeletionJob::new(
         runner,
-        deletion,
+        Arc::clone(&deletion) as _,
         Arc::clone(&periods) as _,
         &cfg.config().deletion,
     ));
@@ -413,6 +407,7 @@ pub fn assemble(
             erasure_worker,
             deletion_job,
             retention: periods,
+            generations: deletion,
         });
     };
     let (hand_off, queue) = record_queue(cfg.config().processing.queue_capacity);
@@ -446,6 +441,7 @@ pub fn assemble(
             writer,
             events: Arc::clone(&events),
             reviews: reviews as _,
+            generations: Arc::clone(&deletion) as _,
         },
         cfg.config().processing.max_reruns,
     ));
@@ -476,6 +472,7 @@ pub fn assemble(
         erasure_worker,
         deletion_job,
         retention: periods,
+        generations: deletion,
     })
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
 }
@@ -542,6 +539,19 @@ struct Configured {
 }
 
 impl Configured {
+    /// Which of processing's prerequisites `cfg` and `model` give.
+    fn of(cfg: &ValidConfig, model: Option<&Arc<dyn ModelClient>>) -> Self {
+        Self {
+            identity: Part::of(cfg.identity().as_ref()),
+            model: Part::of(model),
+            unchecked: if cfg.config().processing.run_without_sensitive_data_checks {
+                Part::Present
+            } else {
+                Part::Missing
+            },
+        }
+    }
+
     /// Say at start-up what is not configured: an info line when processing
     /// is off on purpose (neither identity nor model), a warning when it is
     /// only partly configured or lacks the opt-in to run without

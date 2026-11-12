@@ -15,7 +15,7 @@ use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use super::DbProvider;
-use super::deletion::{RetentionPeriods, period_start};
+use super::deletion::{ProfileGenerations, RetentionPeriods, period_start};
 use super::error::DomainError;
 use super::plan::{Origin, Plan};
 pub use super::refusal::{Place, Refusal, RefusalReason};
@@ -231,6 +231,12 @@ pub struct ReceivedRecord {
     pub connector: String,
     pub envelope: Envelope,
     pub record: Value,
+    /// The subject's profile generation when the record was taken; 0 for a
+    /// record without a subject. Processing drops the record once an erasure
+    /// moved the generation on, so a record taken before an erasure is never
+    /// stored after it, also once the subject turned personalization on
+    /// again.
+    pub generation: u64,
 }
 
 /// Where processing dropped a received record.
@@ -290,6 +296,8 @@ pub enum DropReason {
     PersonalizationOff,
     /// Admission: an erasure of the subject is under way.
     ErasureInProgress,
+    /// Admission: the subject was erased after the record was taken.
+    ErasedSinceTaken,
     /// Admission: the tenant does not trust the connector.
     UntrustedSource,
     /// Admission: a step is below the tenant's confidence floor.
@@ -313,6 +321,7 @@ impl DropReason {
             Self::CheckFailed => "check_failed",
             Self::PersonalizationOff => "personalization_off",
             Self::ErasureInProgress => "erasure_in_progress",
+            Self::ErasedSinceTaken => "erased_since_taken",
             Self::UntrustedSource => "untrusted_source",
             Self::BelowConfidenceFloor => "below_confidence_floor",
             Self::EntityKindNotAllowed => "entity_kind_not_allowed",
@@ -514,6 +523,8 @@ pub struct IntakePorts {
     /// tenant's period began is refused, so retention's removal of a record
     /// identity does not let it be stored again.
     pub retention: Arc<dyn RetentionPeriods>,
+    /// The subjects' profile generations, which a taken record carries.
+    pub generations: Arc<dyn ProfileGenerations>,
 }
 
 #[domain_model]
@@ -603,7 +614,7 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
         // and the commit follow at once, so an erasure that waits several
         // windows after its mark also finds this record's identity.
         let deadline = tokio::time::Instant::now() + self.receive_window;
-        tokio::time::timeout_at(
+        let generation = tokio::time::timeout_at(
             deadline,
             self.check_tenant_and_subject(ctx, &scope, tenant_id, connector, &envelope),
         )
@@ -614,6 +625,7 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
             connector: connector.to_string(),
             envelope,
             record,
+            generation,
         };
         self.take(scope, received, deadline).await
         // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-window
@@ -715,7 +727,8 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
 
     /// The tenant's and the subject's checks: the connector is on, the record
     /// was observed within the tenant's retention period, and, for a record
-    /// about a subject, personalization is on with no erasure under way.
+    /// about a subject, personalization is on with no erasure under way. Gives
+    /// the subject's profile generation, 0 for a record without a subject.
     // cancel-safe: it only reads the connector switch and the subject's
     // settings, so the receive window can drop it at any point.
     async fn check_tenant_and_subject(
@@ -725,7 +738,7 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
         tenant_id: Uuid,
         connector: Uuid,
         envelope: &Envelope,
-    ) -> Result<(), DomainError> {
+    ) -> Result<u64, DomainError> {
         let refuse = |reason: RefusalReason, place: Place, rule: &str| {
             Err(Refusal::new(reason, Some(&envelope.type_id), place, rule).into())
         };
@@ -758,19 +771,13 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
 
         // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-subject
         let Some(subject_id) = envelope.subject_id else {
-            return Ok(());
+            return Ok(0);
         };
-        let settings = self
-            .settings
-            .settings_within(
-                ctx,
-                scope,
-                SubjectKey {
-                    tenant_id,
-                    subject_id,
-                },
-            )
-            .await?;
+        let key = SubjectKey {
+            tenant_id,
+            subject_id,
+        };
+        let settings = self.settings.settings_within(ctx, scope, key).await?;
         if settings.erasure_in_progress {
             return refuse(
                 RefusalReason::ErasureInProgress,
@@ -785,7 +792,10 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
                 "personalization is off for the subject",
             );
         }
-        Ok(())
+        // An erasure moves the generation on only after it waited out every
+        // record taken before its mark, so this read, inside the receive
+        // window, gives the generation the record was taken in.
+        self.ports.generations.generation(key).await
         // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-subject
     }
 }

@@ -13,6 +13,7 @@
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [Run an Erasure](#run-an-erasure)
   - [The Root Key of a Generation](#the-root-key-of-a-generation)
+  - [A Record Taken Before an Erasure](#a-record-taken-before-an-erasure)
   - [Run a Stopped Erasure Again](#run-a-stopped-erasure-again)
   - [Log Deletion's Events](#log-deletions-events)
   - [Wire Erasure](#wire-erasure)
@@ -73,7 +74,6 @@ The PRD requires that the subject can erase everything, that deleted data is not
 
 - Graph storage has only a soft delete until it ships a hard delete (gears-rust #5194). The removed facts and the root stay in graph storage as tombstones, with their content and embeddings, so the 30-day removal of `cpt-cf-construct-nfr-deletion-time` is not met yet. The delete sits behind one interface (`FactRemoval`), so the swap changes nothing here; the tombstones left before it need a one-off removal.
 - An erasure that keeps failing is tried again every run until someone fixes its cause. It goes behind the erasures not yet tried, so it does not hold them up, and a failure a rerun does not cure is logged as an error each time; nothing counts the attempts or gives up.
-- A record received before the mark and still waiting in the processing queue when the erasure ends is dropped by Admission while personalization is off. If the subject turns personalization on before that record is processed, it is stored.
 - Once an erasure has removed the record identities, a replay of the subject's records is a new record, refused while personalization is off; after the subject turns it on again, it is taken. A connector **MUST NOT** send again a record refused with `ERASURE_IN_PROGRESS` (`cpt-cf-construct-feature-record-intake`).
 
 **Out of scope**:
@@ -155,6 +155,17 @@ The PRD requires that the subject can erase everything, that deleted data is not
 1. [x] - `p1` - DB: read the subject's profile generation from its settings row in its tenant; a subject without a row is in generation 0 - `inst-root-read`
 2. [x] - `p1` - **RETURN** `construct:<tenant>:root:<subject>` for generation 0, and `construct:<tenant>:root:<subject>:<generation>` for any other - `inst-root-key`
 
+### A Record Taken Before an Erasure
+
+- [x] `p1` - **ID**: `cpt-cf-construct-algo-erasure-generation`
+
+**Input**: A received record about a subject, with the profile generation intake read for the subject when it took the record.
+
+**Output**: The record goes on to Admission, or it is dropped.
+
+**Steps**:
+1. [x] - `p1` - Before Admission, DB: read the subject's profile generation (`cpt-cf-construct-algo-erasure-root-key`). **IF** it is past the record's, drop the record at Admission with the reason `erased_since_taken`, also when the subject turned personalization on again. An erasure marked after this read stops the write at Admission's settings read, or waits it out - `inst-generation-admit`
+
 ### Run a Stopped Erasure Again
 
 - [x] `p1` - **ID**: `cpt-cf-construct-algo-erasure-rerun`
@@ -222,7 +233,7 @@ The system **MUST** remove every fact and the profile root of a subject whose er
 - Cluster: the leader election `construct/deletion` of the cluster profile `construct`
 - Config: `deletion.erasure_workers`, `deletion.job_interval_secs`, `processing.max_reruns`
 
-**Verified by**: `an_erasure_removes_every_fact_and_the_root_then_finishes_and_says_so`, `no_erasure_under_way_changes_nothing`, `a_fact_written_after_the_removal_leaves_the_erasure_marked_for_the_next_run`, `an_interrupted_erasure_completes_when_it_runs_again`, `an_erasure_without_a_processing_identity_is_not_configured_and_stays_marked`, `an_erasure_removes_the_tables_rows_only_once_the_receive_window_after_its_mark_is_over`, `an_erasure_whose_write_conflicts_reads_the_profile_again_and_removes_it_all`, `an_erasure_whose_write_may_have_landed_is_unavailable_and_stays_marked`, `an_erasure_another_run_finished_meanwhile_is_not_under_way_and_says_nothing`, `the_requests_run_leaves_an_erasure_marked_long_ago_to_the_leader`, `a_write_that_lands_during_the_wait_is_removed_before_the_erasure_finishes`, `a_run_whose_erasure_another_run_finished_leaves_the_new_profile` (Deletion), `a_finish_for_another_mark_leaves_the_erasure_under_way_and_removes_nothing` (store), `a_record_admitted_on_a_settings_read_past_the_budget_is_not_written`, `an_agents_plan_admitted_on_a_settings_read_past_the_budget_is_not_written` (processing), `the_job_runs_the_stopped_erasures_but_leaves_a_fresh_one_to_its_request`, `the_worker_runs_no_more_graph_steps_at_once_than_it_has_workers_and_waits_without_one`, `the_worker_does_not_start_an_erasure_it_is_running_already`, `the_worker_leaves_an_erasure_marked_long_ago_to_the_leader`, `an_erasure_that_panicked_can_run_again_on_the_same_worker`, `the_requests_run_stops_once_its_mark_is_stale_and_leaves_the_rest_to_the_leader`, `an_erasure_whose_write_is_refused_fails_as_refused_not_as_unavailable`, `a_root_whose_listed_deletes_never_end_stays_and_its_removal_is_unavailable_in_time`, `the_write_runs_by_the_answer_deadline`, `a_records_write_that_never_ends_is_dropped_at_the_writer_limit`, `the_job_runs_while_this_instance_leads_and_stops_when_it_loses_the_lead`, `a_host_without_the_construct_profile_resolves_no_election_and_runs_no_job`, `a_cluster_that_does_not_answer_yet_is_tried_again_after_a_pause`, `a_retention_sweep_that_does_not_end_does_not_hold_off_a_stopped_erasure`, `a_rerun_that_panics_is_logged_and_the_next_run_finishes_the_erasure`, `the_worker_runs_no_more_erasures_at_once_than_its_queue_and_the_next_once_one_ends`, `the_election_backoff_doubles_up_to_its_longest_with_jitter` (job), `start_runs_the_erasure_worker_and_the_leaders_job_and_stop_ends_them`, `a_deletion_task_that_ignores_stop_is_aborted_at_the_deadline`, `a_deletion_task_that_panicked_makes_stop_fail` (gear), `a_record_not_taken_within_the_receive_window_is_unavailable_and_keeps_nothing`, `an_identity_insert_past_the_receive_window_is_rolled_back_before_the_hand_off`, `the_check_and_the_insert_share_one_receive_window`, `a_check_and_an_insert_that_fit_in_the_receive_window_together_take_the_record`, `a_record_taken_after_its_receive_window_is_named_in_a_warning_and_a_late_repeat_is_not` (intake), `an_erased_subject_is_served_nothing_at_once_keeps_only_its_setting_and_later_starts_anew` (pipeline). The cluster gear's own election backend was not run in a test: a scripted election over the cluster SDK's stub client stands in for it, and a fake leadership in the gear's tests.
+**Verified by**: `an_erasure_removes_every_fact_and_the_root_then_finishes_and_says_so`, `no_erasure_under_way_changes_nothing`, `a_fact_written_after_the_removal_leaves_the_erasure_marked_for_the_next_run`, `an_interrupted_erasure_completes_when_it_runs_again`, `an_erasure_without_a_processing_identity_is_not_configured_and_stays_marked`, `an_erasure_removes_the_tables_rows_only_once_the_receive_window_after_its_mark_is_over`, `an_erasure_whose_write_conflicts_reads_the_profile_again_and_removes_it_all`, `an_erasure_whose_write_may_have_landed_is_unavailable_and_stays_marked`, `an_erasure_another_run_finished_meanwhile_is_not_under_way_and_says_nothing`, `the_requests_run_leaves_an_erasure_marked_long_ago_to_the_leader`, `a_write_that_lands_during_the_wait_is_removed_before_the_erasure_finishes`, `a_run_whose_erasure_another_run_finished_leaves_the_new_profile` (Deletion), `a_finish_for_another_mark_leaves_the_erasure_under_way_and_removes_nothing` (store), `a_record_admitted_on_a_settings_read_past_the_budget_is_not_written`, `an_agents_plan_admitted_on_a_settings_read_past_the_budget_is_not_written` (processing), `the_job_runs_the_stopped_erasures_but_leaves_a_fresh_one_to_its_request`, `the_worker_runs_no_more_graph_steps_at_once_than_it_has_workers_and_waits_without_one`, `the_worker_does_not_start_an_erasure_it_is_running_already`, `the_worker_leaves_an_erasure_marked_long_ago_to_the_leader`, `an_erasure_that_panicked_can_run_again_on_the_same_worker`, `the_requests_run_stops_once_its_mark_is_stale_and_leaves_the_rest_to_the_leader`, `an_erasure_whose_write_is_refused_fails_as_refused_not_as_unavailable`, `a_root_whose_listed_deletes_never_end_stays_and_its_removal_is_unavailable_in_time`, `the_write_runs_by_the_answer_deadline`, `a_records_write_that_never_ends_is_dropped_at_the_writer_limit`, `the_job_runs_while_this_instance_leads_and_stops_when_it_loses_the_lead`, `a_host_without_the_construct_profile_resolves_no_election_and_runs_no_job`, `a_cluster_that_does_not_answer_yet_is_tried_again_after_a_pause`, `a_retention_sweep_that_does_not_end_does_not_hold_off_a_stopped_erasure`, `a_rerun_that_panics_is_logged_and_the_next_run_finishes_the_erasure`, `the_worker_runs_no_more_erasures_at_once_than_its_queue_and_the_next_once_one_ends`, `the_election_backoff_doubles_up_to_its_longest_with_jitter` (job), `start_runs_the_erasure_worker_and_the_leaders_job_and_stop_ends_them`, `a_deletion_task_that_ignores_stop_is_aborted_at_the_deadline`, `a_deletion_task_that_panicked_makes_stop_fail` (gear), `a_record_not_taken_within_the_receive_window_is_unavailable_and_keeps_nothing`, `an_identity_insert_past_the_receive_window_is_rolled_back_before_the_hand_off`, `the_check_and_the_insert_share_one_receive_window`, `a_check_and_an_insert_that_fit_in_the_receive_window_together_take_the_record`, `a_record_taken_after_its_receive_window_is_named_in_a_warning_and_a_late_repeat_is_not` (intake), `an_erased_subject_is_served_nothing_at_once_keeps_only_its_setting_and_later_starts_anew` (pipeline), `a_taken_record_carries_its_subjects_generation` (intake), `a_record_taken_before_an_erasure_is_dropped_after_it_though_personalization_is_on` (processing). The cluster gear's own election backend was not run in a test: a scripted election over the cluster SDK's stub client stands in for it, and a fake leadership in the gear's tests.
 
 ### The Root After an Erasure
 
@@ -242,10 +253,11 @@ The system **MUST** soft-delete the subject's profile root only once no live fac
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-erasure-root-key`
 
-The system **MUST** keep each subject's profile generation and **MUST** read and write its profile under the root key of that generation, so a profile created after an erasure gets a new root, while every profile not erased keeps the root key it had.
+The system **MUST** keep each subject's profile generation and **MUST** read and write its profile under the root key of that generation, so a profile created after an erasure gets a new root, while every profile not erased keeps the root key it had. A record **MUST** carry the generation its subject was in when intake took it, and processing **MUST** drop a record whose generation an erasure has moved on since, so a record taken before an erasure is never stored after it.
 
 **Implements**:
 - `cpt-cf-construct-algo-erasure-root-key`
+- `cpt-cf-construct-algo-erasure-generation`
 
 **Touches**:
 - DB Table: `construct__subject_settings`, column `profile_generation`

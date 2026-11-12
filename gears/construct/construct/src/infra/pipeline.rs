@@ -383,15 +383,12 @@ pub fn assemble(
         deletion_events,
         policy_enforcer.clone(),
     ));
-    let deletion_job = Arc::new(DeletionJob {
-        deletion: runner,
-        store: deletion,
-        periods: Arc::clone(&periods) as _,
-        interval: Duration::from_secs(cfg.config().deletion.job_interval_secs.get()),
-        retention_interval: Duration::from_secs(
-            cfg.config().deletion.retention_interval_secs.get(),
-        ),
-    });
+    let deletion_job = Arc::new(DeletionJob::new(
+        runner,
+        deletion,
+        Arc::clone(&periods) as _,
+        &cfg.config().deletion,
+    ));
     // @cpt-end:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-deletion
 
     // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing

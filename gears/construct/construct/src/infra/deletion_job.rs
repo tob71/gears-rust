@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use toolkit::client_hub::ClientHub;
 use uuid::Uuid;
 
+use crate::config::DeletionConfig;
 use crate::domain::deletion::{Deletion, DeletionStore, Erasure, RetentionPeriods};
 use crate::domain::erasure::ErasureQueue;
 use crate::domain::error::DomainError;
@@ -270,6 +271,23 @@ pub struct DeletionJob {
 }
 
 impl DeletionJob {
+    /// The job with the intervals `config` sets.
+    #[must_use]
+    pub fn new(
+        deletion: Arc<Deletion>,
+        store: Arc<dyn DeletionStore>,
+        periods: Arc<dyn RetentionPeriods>,
+        config: &DeletionConfig,
+    ) -> Self {
+        Self {
+            deletion,
+            store,
+            periods,
+            interval: Duration::from_secs(config.job_interval_secs.get()),
+            retention_interval: Duration::from_secs(config.retention_interval_secs.get()),
+        }
+    }
+
     /// One run: every erasure marked longer than [`STALE`] ago and still
     /// under way, up to [`BATCH`], then each tenant with a retention period.
     /// What fails is logged and left for the next run.

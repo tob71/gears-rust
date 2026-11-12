@@ -48,12 +48,14 @@ pub const WRITE_LANDED: Duration =
 const LANDED_CHECK: Duration = Duration::from_secs(5);
 
 /// A subject's live facts, and the version of its profile they belong to;
-/// none for a subject without a profile.
+/// none for a subject without a profile. `generation` is the profile
+/// generation the read was in.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubjectFacts {
     pub version: Option<u64>,
     pub facts: Vec<StoredFact>,
+    pub generation: u64,
 }
 
 /// Reads a subject's live facts with its profile's version, as Construct.

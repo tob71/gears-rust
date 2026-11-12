@@ -50,8 +50,10 @@ pub enum RootRemoval {
 /// Removes a subject's profile root once its facts are removed.
 #[async_trait]
 pub trait ProfileRoots: Send + Sync {
-    /// Soft-delete the root of the subject's current generation, and every
-    /// fact it lists for removal whose delete has not run.
+    /// Soft-delete the subject's root of `generation`, and every fact it
+    /// lists for removal whose delete has not run. The root of any other
+    /// generation is left alone: an erasure removes only the profile it
+    /// started on.
     ///
     /// # Errors
     ///
@@ -61,6 +63,7 @@ pub trait ProfileRoots: Send + Sync {
         &self,
         ctx: &SecurityContext,
         key: SubjectKey,
+        generation: u64,
     ) -> Result<RootRemoval, DomainError>;
 }
 
@@ -93,6 +96,16 @@ pub struct ExpiredRows {
     pub record_ids: u64,
 }
 
+/// An erasure under way: when it was marked, and the subject's profile
+/// generation it erases, read from one row, so the generation is the one the
+/// erasure moves on when it finishes.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    pub at: OffsetDateTime,
+    pub generation: u64,
+}
+
 /// Construct's own tables as erasure and retention change them.
 #[async_trait]
 pub trait DeletionStore: Send + Sync {
@@ -107,17 +120,18 @@ pub trait DeletionStore: Send + Sync {
         at: OffsetDateTime,
     ) -> Result<SettingsWrite, DomainError>;
 
-    /// When the erasure under way was marked; none when there is none.
+    /// The erasure under way, with the generation it erases; none when
+    /// there is none.
     async fn marked(
         &self,
         scope: &AccessScope,
         key: SubjectKey,
-    ) -> Result<Option<OffsetDateTime>, DomainError>;
+    ) -> Result<Option<Mark>, DomainError>;
 
     /// In one transaction: remove the subject's review requests and record
     /// identities, move its profile generation on and clear the mark and the
     /// last attempt. Only while the erasure marked at `marked_at`, as
-    /// [`Self::marked`] gave it, is under way, so a run never finishes
+    /// [`Self::marked`] gave its time, is under way, so a run never finishes
     /// another erasure; whether it was.
     async fn finish(
         &self,
@@ -321,6 +335,7 @@ async fn permit(busy: Option<&Semaphore>) -> Result<Option<SemaphorePermit<'_>>,
 
 /// What one removal of facts left: the keys of the facts it removed, and of
 /// the subject's live facts after it.
+#[derive(Default)]
 struct Removal {
     removed: BTreeSet<NodeKey>,
     kept: BTreeSet<NodeKey>,
@@ -412,13 +427,14 @@ impl Deletion {
     ) -> Result<Erasure, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-marked
         let (construct, scope) = self.ports.writes.construct(key.tenant_id).await?;
-        let Some(marked_at) = self.ports.store.marked(&scope, key).await? else {
+        let Some(mark) = self.ports.store.marked(&scope, key).await? else {
             return Ok(Erasure::NotUnderWay);
         };
         let Some((stale, busy)) = requested else {
-            return self.steps(&construct, &scope, key, marked_at, None).await;
+            return self.steps(&construct, &scope, key, mark, None).await;
         };
-        let left = marked_at
+        let left = mark
+            .at
             .checked_add(time::Duration::try_from(stale).unwrap_or(time::Duration::MAX))
             .map(|cut| cut - OffsetDateTime::now_utc())
             .and_then(|left| Duration::try_from(left).ok())
@@ -427,7 +443,7 @@ impl Deletion {
             return Ok(Erasure::LeftToLeader);
         };
         // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-marked
-        let steps = self.steps(&construct, &scope, key, marked_at, Some(busy));
+        let steps = self.steps(&construct, &scope, key, mark, Some(busy));
         if let Ok(done) = tokio::time::timeout(left, steps).await {
             return done;
         }
@@ -435,15 +451,18 @@ impl Deletion {
         Ok(Erasure::LeftToLeader)
     }
 
-    /// The steps of an erasure marked at `marked_at`, from the first removal
-    /// to the finish, the graph and table steps each under a permit of
-    /// `busy` when there is one.
+    /// The steps of the erasure `mark` names, from the first removal to the
+    /// finish, the graph and table steps each under a permit of `busy` when
+    /// there is one. Every graph step stays on the generation the mark
+    /// erases: another run can finish the erasure at any point, and the
+    /// subject start a new profile in the next generation, which this run
+    /// must leave alone.
     async fn steps(
         &self,
         construct: &SecurityContext,
         scope: &AccessScope,
         key: SubjectKey,
-        marked_at: OffsetDateTime,
+        mark: Mark,
         busy: Option<&Semaphore>,
     ) -> Result<Erasure, DomainError> {
         {
@@ -451,10 +470,16 @@ impl Deletion {
             // The root stays until the wait is over: a write admitted before
             // the mark can still attach a fact to it, and the removal after
             // the wait finds that fact only through the root.
-            self.remove_every_fact(construct, key).await?;
+            if !self
+                .remove_every_fact(construct, key, mark.generation)
+                .await?
+            {
+                return Ok(Erasure::NotUnderWay);
+            }
         }
         // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-wait
-        let wait = marked_at
+        let wait = mark
+            .at
             .checked_add(time::Duration::try_from(ERASURE_WAIT).unwrap_or(time::Duration::MAX))
             .map(|ready| ready - OffsetDateTime::now_utc());
         if let Some(Ok(wait)) = wait.map(Duration::try_from) {
@@ -467,14 +492,18 @@ impl Deletion {
         let _busy = permit(busy).await?;
         // Another run may have finished this erasure during the wait, and the
         // subject started a new profile since: only the erasure this run
-        // started is cleared and finished.
-        if self.ports.store.marked(scope, key).await? != Some(marked_at) {
+        // started is cleared and finished. The check saves the graph calls;
+        // a finish just after it is caught by the generation each graph
+        // step keeps to.
+        if self.ports.store.marked(scope, key).await? != Some(mark) {
             return Ok(Erasure::NotUnderWay);
         }
-        self.clear_graph(construct, key).await?;
+        if !self.clear_graph(construct, key, mark.generation).await? {
+            return Ok(Erasure::NotUnderWay);
+        }
         // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-wait
         // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-finish
-        if !self.ports.store.finish(scope, key, marked_at).await? {
+        if !self.ports.store.finish(scope, key, mark.at).await? {
             return Ok(Erasure::NotUnderWay);
         }
         self.ports.events.record(DeletionEvent::Erased {
@@ -485,39 +514,54 @@ impl Deletion {
         // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-finish
     }
 
-    /// Remove every fact of the subject's current generation, then its root.
+    /// Remove every fact of the subject's profile in `generation`, then its
+    /// root; whether the profile was still in that generation, false when
+    /// the erasure was finished and nothing was removed.
     async fn clear_graph(
         &self,
         construct: &SecurityContext,
         key: SubjectKey,
-    ) -> Result<(), DomainError> {
-        self.remove_every_fact(construct, key).await?;
+        generation: u64,
+    ) -> Result<bool, DomainError> {
+        if !self.remove_every_fact(construct, key, generation).await? {
+            return Ok(false);
+        }
         // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-root
-        if let RootRemoval::FactsLeft(left) = self.ports.roots.remove_root(construct, key).await? {
+        let removal = self
+            .ports
+            .roots
+            .remove_root(construct, key, generation)
+            .await?;
+        if let RootRemoval::FactsLeft(left) = removal {
             return Err(DomainError::Unavailable(format!(
                 "{left} facts of subject {} were written after its facts were removed; the \
                  erasure runs again",
                 key.subject_id
             )));
         }
-        Ok(())
+        Ok(true)
         // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-root
     }
 
-    /// Remove every live fact of the subject's current generation, keeping
-    /// its root.
+    /// Remove every live fact of the subject's profile in `generation`,
+    /// keeping its root; whether the profile was still in that generation,
+    /// false when the erasure was finished and nothing was removed.
     async fn remove_every_fact(
         &self,
         construct: &SecurityContext,
         key: SubjectKey,
-    ) -> Result<(), DomainError> {
+        generation: u64,
+    ) -> Result<bool, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-facts
         let origin = Origin::Subject {
             subject: key.subject_id,
         };
-        self.remove_facts(construct, key, &origin, "erasure", |_| true)
+        let removal = self
+            .remove_facts(construct, key, &origin, "erasure", Some(generation), |_| {
+                true
+            })
             .await?;
-        Ok(())
+        Ok(removal.is_some())
         // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-facts
     }
 
@@ -632,11 +676,18 @@ impl Deletion {
         before: OffsetDateTime,
     ) -> Result<Expired, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-retention-expire:p2:inst-expire-facts
+        // Retention takes the profile in whatever generation it is now.
         let Removal { removed, kept } = self
-            .remove_facts(construct, key, &Origin::Retention, "retention", |fact| {
-                fact.stored_at < before
-            })
-            .await?;
+            .remove_facts(
+                construct,
+                key,
+                &Origin::Retention,
+                "retention",
+                None,
+                |fact| fact.stored_at < before,
+            )
+            .await?
+            .unwrap_or_default();
         if !removed.is_empty() {
             self.ports.events.record(DeletionEvent::FactsExpired {
                 tenant_id: key.tenant_id,
@@ -694,14 +745,21 @@ impl Deletion {
     /// against the profile's version: read and written again after a short
     /// pause on a conflict, within the rerun limit and the write budget, so
     /// a fact a write changed in between is decided again.
+    ///
+    /// With a `generation`, only a profile read in that generation is
+    /// changed: none, and nothing written, once a read finds the profile in
+    /// another one. The version a read gives names its generation, so a plan
+    /// read in one generation conflicts with a root of another and is read
+    /// again.
     async fn remove_facts(
         &self,
         construct: &SecurityContext,
         key: SubjectKey,
         origin: &Origin,
         what: &str,
+        generation: Option<u64>,
         chosen: impl Fn(&StoredFact) -> bool,
-    ) -> Result<Removal, DomainError> {
+    ) -> Result<Option<Removal>, DomainError> {
         let writes = &self.ports.writes;
         let deadline = writes.deadline();
         let chosen = &chosen;
@@ -710,14 +768,17 @@ impl Deletion {
                 let current =
                     ProfileWrites::before_write(deadline, what, writes.read(construct, key))
                         .await?;
+                if generation.is_some_and(|generation| generation != current.generation) {
+                    return Ok(Attempt::Done(None));
+                }
                 let (gone, kept): (Vec<StoredFact>, Vec<StoredFact>) =
                     current.facts.into_iter().partition(|fact| chosen(fact));
                 let kept: BTreeSet<NodeKey> = kept.into_iter().map(|fact| fact.node_key).collect();
                 if gone.is_empty() {
-                    return Ok(Attempt::Done(Removal {
+                    return Ok(Attempt::Done(Some(Removal {
                         removed: BTreeSet::new(),
                         kept,
-                    }));
+                    })));
                 }
                 let ids: BTreeSet<&NodeKey> = gone.iter().map(|fact| &fact.node_key).collect();
                 let plan = removals(key, current.version, &gone, origin.clone());
@@ -727,10 +788,10 @@ impl Deletion {
                     })
                     .await?;
                 Ok(match written {
-                    Written::Stored => Attempt::Done(Removal {
+                    Written::Stored => Attempt::Done(Some(Removal {
                         removed: gone.into_iter().map(|fact| fact.node_key).collect(),
                         kept,
-                    }),
+                    })),
                     Written::Conflict => Attempt::Conflict,
                 })
             })

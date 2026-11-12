@@ -216,11 +216,13 @@ async fn the_mark_read_back_finishes_its_erasure_and_no_other() {
     let now = OffsetDateTime::now_utc();
 
     store.mark(&scope, key, now).await.expect("the mark");
-    let marked = store
+    let mark = store
         .marked(&scope, key)
         .await
         .unwrap()
         .expect("an erasure under way");
+    assert_eq!(mark.generation, 0);
+    let marked = mark.at;
     assert!(
         (marked - now).abs() < Duration::milliseconds(1),
         "{marked} for {now}"
@@ -245,7 +247,7 @@ async fn the_mark_read_back_finishes_its_erasure_and_no_other() {
 
     assert!(store.finish(&scope, key, marked).await.unwrap());
     assert_eq!(store.generation(key).await.unwrap(), 1);
-    assert_eq!(store.marked(&scope, key).await.unwrap(), None);
+    assert!(store.marked(&scope, key).await.unwrap().is_none());
     assert_eq!(generation_of(&pg.conn, key).await, 1);
 }
 

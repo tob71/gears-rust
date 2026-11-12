@@ -15,7 +15,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::DbProvider;
-use crate::domain::deletion::{DeletionStore, ExpiredRows, KnownTenants, ProfileGenerations};
+use crate::domain::deletion::{DeletionStore, ExpiredRows, KnownTenants, Mark, ProfileGenerations};
 use crate::domain::error::DomainError;
 use crate::domain::subject_settings::{SettingsWrite, SubjectKey};
 
@@ -187,18 +187,22 @@ impl DeletionStore for DeletionTables {
         &self,
         scope: &AccessScope,
         key: SubjectKey,
-    ) -> Result<Option<OffsetDateTime>, DomainError> {
+    ) -> Result<Option<Mark>, DomainError> {
         let conn = self.db.conn().map_err(DomainError::from)?;
-        Ok(row(&conn, scope, key)
+        let Some(stored) = row(&conn, scope, key)
             .await?
             .filter(|stored| stored.erasure_in_progress)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Mark {
             // A mark from before its time was kept counts from the epoch:
             // it is old enough to finish.
-            .map(|stored| {
-                stored
-                    .erasure_marked_at
-                    .unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            }))
+            at: stored
+                .erasure_marked_at
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            generation: generation_of(key, stored.profile_generation)?,
+        }))
     }
 
     async fn finish(
@@ -488,12 +492,17 @@ impl ProfileGenerations for DeletionTables {
         let generation = row(&conn, &AccessScope::for_tenant(key.tenant_id), key)
             .await?
             .map_or(0, |stored| stored.profile_generation);
-        u64::try_from(generation).map_err(|_| {
-            DomainError::internal(format!(
-                "subject {} of tenant {} has a negative profile generation {generation}",
-                key.subject_id, key.tenant_id
-            ))
-        })
+        generation_of(key, generation)
         // @cpt-end:cpt-cf-construct-algo-erasure-root-key:p1:inst-root-read
     }
+}
+
+/// The subject's profile generation as the row stores it.
+fn generation_of(key: SubjectKey, generation: i64) -> Result<u64, DomainError> {
+    u64::try_from(generation).map_err(|_| {
+        DomainError::internal(format!(
+            "subject {} of tenant {} has a negative profile generation {generation}",
+            key.subject_id, key.tenant_id
+        ))
+    })
 }

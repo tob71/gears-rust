@@ -2446,7 +2446,7 @@ async fn a_root_whose_listed_deletes_never_end_stays_and_its_removal_is_unavaila
     let started = tokio::time::Instant::now();
 
     let err = writer
-        .remove_root(&profiles.ctx, profiles.subject_key())
+        .remove_root(&profiles.ctx, profiles.subject_key(), 0)
         .await;
 
     assert!(

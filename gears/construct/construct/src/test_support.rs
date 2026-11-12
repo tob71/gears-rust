@@ -1165,10 +1165,12 @@ pub fn stored_fact(
 /// each read: the subject of the context it was read with, and the key.
 /// With an owner, it is that subject's profile only, and any other key reads
 /// as a subject without a profile. Each read takes `delay` first, and fails
-/// as larger than one read takes while `too_large` is set.
+/// as larger than one read takes while `too_large` is set. Its facts are in
+/// profile generation `generation`.
 #[derive(Default)]
 pub struct MemoryProfile {
     pub version: std::sync::Mutex<Option<u64>>,
+    pub generation: std::sync::atomic::AtomicU64,
     pub facts: std::sync::Mutex<Vec<crate::domain::profile_read::StoredFact>>,
     pub reads: std::sync::Mutex<Vec<(Uuid, SubjectKey)>>,
     pub delay: std::sync::Mutex<std::time::Duration>,
@@ -1181,10 +1183,8 @@ impl MemoryProfile {
         Arc::new(Self {
             version: std::sync::Mutex::new(Some(1)),
             facts: std::sync::Mutex::new(facts),
-            reads: std::sync::Mutex::default(),
-            delay: std::sync::Mutex::default(),
-            too_large: std::sync::atomic::AtomicBool::new(false),
             owner: None,
+            ..Self::default()
         })
     }
 
@@ -1193,10 +1193,8 @@ impl MemoryProfile {
         Arc::new(Self {
             version: std::sync::Mutex::new(Some(1)),
             facts: std::sync::Mutex::new(facts),
-            reads: std::sync::Mutex::default(),
-            delay: std::sync::Mutex::default(),
-            too_large: std::sync::atomic::AtomicBool::new(false),
             owner: Some(owner),
+            ..Self::default()
         })
     }
 
@@ -1231,15 +1229,18 @@ impl crate::domain::profile_writes::SubjectProfiles for MemoryProfile {
                 },
             ));
         }
+        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
         if self.owner.is_some_and(|owner| owner != key) {
             return Ok(crate::domain::profile_writes::SubjectFacts {
                 version: None,
                 facts: Vec::new(),
+                generation,
             });
         }
         Ok(crate::domain::profile_writes::SubjectFacts {
             version: *self.version.lock().unwrap(),
             facts: self.live(),
+            generation,
         })
     }
 }
@@ -1977,6 +1978,9 @@ impl crate::domain::admin_facts::AdminFactsEvents for RecordingAdminEvents {
 #[derive(Default)]
 pub struct MemoryDeletionStore {
     pub marks: std::sync::Mutex<std::collections::BTreeMap<(Uuid, Uuid), time::OffsetDateTime>>,
+    /// Each subject's profile generation, 0 when not listed; a finish moves
+    /// it on.
+    pub generations: std::sync::Mutex<std::collections::BTreeMap<(Uuid, Uuid), u64>>,
     /// When the leader's job last tried each erasure under way.
     pub attempts: std::sync::Mutex<std::collections::BTreeMap<(Uuid, Uuid), time::OffsetDateTime>>,
     pub finished: std::sync::Mutex<Vec<SubjectKey>>,
@@ -2047,13 +2051,17 @@ impl crate::domain::deletion::DeletionStore for MemoryDeletionStore {
         &self,
         _scope: &AccessScope,
         key: SubjectKey,
-    ) -> Result<Option<time::OffsetDateTime>, DomainError> {
-        Ok(self
-            .marks
+    ) -> Result<Option<crate::domain::deletion::Mark>, DomainError> {
+        let id = (key.tenant_id, key.subject_id);
+        let at = self.marks.lock().unwrap().get(&id).copied();
+        let generation = self
+            .generations
             .lock()
             .unwrap()
-            .get(&(key.tenant_id, key.subject_id))
-            .copied())
+            .get(&id)
+            .copied()
+            .unwrap_or(0);
+        Ok(at.map(|at| crate::domain::deletion::Mark { at, generation }))
     }
 
     async fn finish(
@@ -2071,10 +2079,9 @@ impl crate::domain::deletion::DeletionStore for MemoryDeletionStore {
             marks.get(&id) == Some(&marked_at) && marks.remove(&id).is_some()
         };
         if removed {
-            self.attempts
-                .lock()
-                .unwrap()
-                .remove(&(key.tenant_id, key.subject_id));
+            let id = (key.tenant_id, key.subject_id);
+            self.attempts.lock().unwrap().remove(&id);
+            *self.generations.lock().unwrap().entry(id).or_insert(0) += 1;
             self.finished.lock().unwrap().push(key);
         }
         Ok(removed)
@@ -2146,13 +2153,15 @@ impl crate::domain::deletion::DeletionStore for MemoryDeletionStore {
 }
 
 /// [`ProfileRoots`](crate::domain::deletion::ProfileRoots) that answers from
-/// a script, then removed, and counts its calls.
+/// a script, then removed, and counts its calls and keeps the generation
+/// each removed.
 #[derive(Default)]
 pub struct ScriptedRoots {
     pub answers: std::sync::Mutex<
         std::collections::VecDeque<Result<crate::domain::deletion::RootRemoval, DomainError>>,
     >,
     pub calls: std::sync::atomic::AtomicUsize,
+    pub generations: std::sync::Mutex<Vec<u64>>,
     /// Panic at the next call, once.
     pub panic_once: std::sync::atomic::AtomicBool,
     /// How long each call takes.
@@ -2168,9 +2177,11 @@ impl crate::domain::deletion::ProfileRoots for ScriptedRoots {
         &self,
         _ctx: &SecurityContext,
         _key: SubjectKey,
+        generation: u64,
     ) -> Result<crate::domain::deletion::RootRemoval, DomainError> {
         use std::sync::atomic::Ordering;
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.generations.lock().unwrap().push(generation);
         assert!(
             !self.panic_once.swap(false, Ordering::SeqCst),
             "the root removal panicked"

@@ -181,7 +181,7 @@ async fn the_root_goes_once_its_facts_are_gone_and_the_next_generation_starts_a_
     assert_eq!(
         graph
             .writer
-            .remove_root(&graph.ctx, graph.key)
+            .remove_root(&graph.ctx, graph.key, 0)
             .await
             .unwrap(),
         RootRemoval::FactsLeft(1)
@@ -191,7 +191,7 @@ async fn the_root_goes_once_its_facts_are_gone_and_the_next_generation_starts_a_
     assert_eq!(
         graph
             .writer
-            .remove_root(&graph.ctx, graph.key)
+            .remove_root(&graph.ctx, graph.key, 0)
             .await
             .unwrap(),
         RootRemoval::Removed
@@ -201,7 +201,7 @@ async fn the_root_goes_once_its_facts_are_gone_and_the_next_generation_starts_a_
     assert_eq!(
         graph
             .writer
-            .remove_root(&graph.ctx, graph.key)
+            .remove_root(&graph.ctx, graph.key, 0)
             .await
             .unwrap(),
         RootRemoval::Gone,
@@ -257,6 +257,41 @@ async fn the_root_goes_once_its_facts_are_gone_and_the_next_generation_starts_a_
     );
 }
 
+/// A run whose erasure another run finished removes the root it was
+/// started on, not the next generation's.
+#[tokio::test]
+async fn a_root_removal_leaves_the_root_of_a_later_generation() {
+    let graph = Graph::new();
+    graph.add_skill("Rust").await;
+    graph.remove_all().await;
+    assert_eq!(
+        graph
+            .writer
+            .remove_root(&graph.ctx, graph.key, 0)
+            .await
+            .unwrap(),
+        RootRemoval::Removed
+    );
+    graph.generation.0.store(1, Ordering::SeqCst);
+    graph.add_skill("Go").await;
+
+    assert_eq!(
+        graph
+            .writer
+            .remove_root(&graph.ctx, graph.key, 0)
+            .await
+            .unwrap(),
+        RootRemoval::Gone,
+        "generation 0 has no root left"
+    );
+    let new = graph.reader.facts(&graph.ctx, graph.key).await.unwrap();
+    assert_eq!(
+        (new.generation, new.version, new.facts.len()),
+        (1, Some((1 << 32) | 1), 1),
+        "the new profile is untouched"
+    );
+}
+
 #[tokio::test]
 async fn the_root_deletes_the_facts_it_still_lists_before_it_goes() {
     let graph = Graph::new();
@@ -278,7 +313,7 @@ async fn the_root_deletes_the_facts_it_still_lists_before_it_goes() {
     assert_eq!(
         graph
             .writer
-            .remove_root(&graph.ctx, graph.key)
+            .remove_root(&graph.ctx, graph.key, 0)
             .await
             .unwrap(),
         RootRemoval::Removed
@@ -302,7 +337,7 @@ async fn a_root_whose_listed_fact_cannot_be_deleted_stays() {
     graph.removal.failing.store(true, Ordering::SeqCst);
     graph.remove_all().await;
 
-    let err = graph.writer.remove_root(&graph.ctx, graph.key).await;
+    let err = graph.writer.remove_root(&graph.ctx, graph.key, 0).await;
 
     assert!(matches!(err, Err(DomainError::Unavailable(_))), "{err:?}");
     let still = graph.reader.facts(&graph.ctx, graph.key).await.unwrap();

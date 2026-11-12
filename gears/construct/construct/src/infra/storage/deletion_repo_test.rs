@@ -34,7 +34,7 @@ async fn finish_marked(t: &Tables, key: SubjectKey) -> bool {
         .marked(&tenant_scope(key), key)
         .await
         .unwrap()
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+        .map_or(OffsetDateTime::UNIX_EPOCH, |mark| mark.at);
     t.store
         .finish(&tenant_scope(key), key, marked)
         .await
@@ -172,7 +172,7 @@ async fn a_mark_turns_personalization_off_and_marks_the_erasure_on_a_new_row() {
     );
     let marked = t.store.marked(&tenant_scope(key), key).await.unwrap();
     assert_eq!(
-        marked.map(OffsetDateTime::unix_timestamp),
+        marked.map(|mark| mark.at.unix_timestamp()),
         Some(at.unix_timestamp())
     );
     assert_eq!(t.store.generation(key).await.unwrap(), 0);
@@ -201,7 +201,7 @@ async fn a_second_mark_keeps_the_first_time_and_turns_personalization_off_again(
 
     let marked = t.store.marked(&tenant_scope(key), key).await.unwrap();
     assert_eq!(
-        marked.map(OffsetDateTime::unix_timestamp),
+        marked.map(|mark| mark.at.unix_timestamp()),
         Some(first.unix_timestamp()),
         "a second request does not put the end off"
     );
@@ -546,7 +546,11 @@ async fn an_erasure_marked_before_its_time_was_kept_counts_as_marked_long_ago() 
         .unwrap();
 
     assert_eq!(
-        t.store.marked(&tenant_scope(key), key).await.unwrap(),
+        t.store
+            .marked(&tenant_scope(key), key)
+            .await
+            .unwrap()
+            .map(|mark| mark.at),
         Some(OffsetDateTime::UNIX_EPOCH)
     );
     assert_eq!(
@@ -579,7 +583,7 @@ async fn a_mark_on_a_subject_with_settings_turns_personalization_off_and_takes_t
     );
     let marked = t.store.marked(&tenant_scope(key), key).await.unwrap();
     assert_eq!(
-        marked.map(OffsetDateTime::unix_timestamp),
+        marked.map(|mark| mark.at.unix_timestamp()),
         Some(at.unix_timestamp())
     );
 }

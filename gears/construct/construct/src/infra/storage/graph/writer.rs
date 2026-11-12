@@ -18,7 +18,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::fact::fact_node;
-use super::reader::{MAX_FACTS, Stored, read_stored};
+use super::reader::{MAX_FACTS, Stored, read_generation, read_stored};
 use super::root::{ProfileVersion, Root};
 use super::types::GraphTypes;
 use super::{
@@ -683,10 +683,22 @@ impl ProfileRoots for GraphPlanWriter {
         &self,
         ctx: &SecurityContext,
         key: SubjectKey,
+        generation: u64,
     ) -> Result<RootRemoval, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-root
         let subject = subject_in_context(ctx, key)?;
-        let stored = self.read(ctx, &subject).await?;
+        // The root of the generation asked for, not the current one: once
+        // another run finished the erasure, the current root is a new
+        // profile's.
+        let stored = read_generation(
+            self.ports.client.as_ref(),
+            self.ports.version.as_ref(),
+            generation,
+            self.timeout,
+            ctx,
+            &subject,
+        )
+        .await?;
         if stored.version.is_none() {
             return Ok(RootRemoval::Gone);
         }

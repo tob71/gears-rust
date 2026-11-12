@@ -41,8 +41,10 @@ const SNAPSHOT_TRIES: u32 = 3;
 /// none for a subject without a profile, and every live fact node, also those
 /// the root lists for removal whose soft delete has not run yet.
 pub(crate) struct Stored {
-    /// The key of the root, in the subject's current generation.
+    /// The key of the root, in the generation read.
     pub key: NodeKey,
+    /// The generation read.
+    pub generation: u64,
     pub version: Option<u64>,
     pub root: Root,
     pub facts: Vec<NodeView>,
@@ -78,11 +80,29 @@ pub(crate) async fn read_stored(
     ctx: &SecurityContext,
     subject: &ContextSubject,
 ) -> Result<Stored, DomainError> {
+    // @cpt-begin:cpt-cf-construct-algo-erasure-root-key:p1:inst-root-read
+    let generation = generations.generation(*subject.key()).await?;
+    // @cpt-end:cpt-cf-construct-algo-erasure-root-key:p1:inst-root-read
+    read_generation(client, versions, generation, timeout, ctx, subject).await
+}
+
+/// [`read_stored`] of the profile root in `generation`, whatever the
+/// subject's current generation is.
+///
+/// # Errors
+///
+/// As [`read_stored`].
+pub(crate) async fn read_generation(
+    client: &dyn GraphStorageClientV1,
+    versions: &dyn ProfileVersion,
+    generation: u64,
+    timeout: Duration,
+    ctx: &SecurityContext,
+    subject: &ContextSubject,
+) -> Result<Stored, DomainError> {
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-traverse
     let subject = subject.key();
-    // @cpt-begin:cpt-cf-construct-algo-erasure-root-key:p1:inst-root-read
-    let NodeKey(key) = generation_root(subject, generations.generation(*subject).await?);
-    // @cpt-end:cpt-cf-construct-algo-erasure-root-key:p1:inst-root-read
+    let NodeKey(key) = generation_root(subject, generation);
     let request = TraverseRequest {
         seeds: vec![key.clone()],
         depth: 1,
@@ -123,6 +143,7 @@ pub(crate) async fn read_stored(
     let Some(root_node) = response.nodes.iter().find(|node| node.node_key == key) else {
         return Ok(Stored {
             key: NodeKey(key),
+            generation,
             version: None,
             root: Root::default(),
             facts: Vec::new(),
@@ -180,6 +201,7 @@ pub(crate) async fn read_stored(
         .collect();
     Ok(Stored {
         key: NodeKey(key),
+        generation,
         version: Some(version),
         root,
         facts,
@@ -368,6 +390,7 @@ impl SubjectProfiles for GraphProfileSource {
         Ok(SubjectFacts {
             version: stored.version,
             facts,
+            generation: stored.generation,
         })
         // @cpt-end:cpt-cf-construct-algo-subject-control-read-facts:p1:inst-facts-read
     }

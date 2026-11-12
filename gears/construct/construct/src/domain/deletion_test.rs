@@ -944,3 +944,80 @@ async fn a_run_whose_erasure_another_run_finished_leaves_the_new_profile() {
     assert_eq!(fx.profile.live(), [new], "the new profile stays");
     assert_eq!(fx.writer.plans().len(), 1, "only the first removal wrote");
 }
+
+#[tokio::test]
+async fn an_erasure_removes_the_root_of_the_generation_it_erases() {
+    let fx = Fixture::new();
+    fx.store
+        .generations
+        .lock()
+        .unwrap()
+        .insert((fx.key.tenant_id, fx.key.subject_id), 2);
+    fx.profile.generation.store(2, Ordering::SeqCst);
+    fx.marked_long_ago();
+
+    let done = fx
+        .deletion(FixedDirectory::default())
+        .erase(fx.key)
+        .await
+        .unwrap();
+
+    assert_eq!(done, Erasure::Done);
+    assert_eq!(*fx.roots.generations.lock().unwrap(), [2]);
+}
+
+/// Another run finishes the erasure and the subject starts a new profile
+/// before this run's first removal reads the profile: the run reads the next
+/// generation's profile and leaves it.
+#[tokio::test]
+async fn a_run_that_reads_a_new_generations_profile_first_leaves_it() {
+    let fx = Fixture::new();
+    fx.marked_long_ago();
+    fx.profile.generation.store(1, Ordering::SeqCst);
+    let before = fx.profile.live();
+
+    let done = fx
+        .deletion(FixedDirectory::default())
+        .erase(fx.key)
+        .await
+        .unwrap();
+
+    assert_eq!(done, Erasure::NotUnderWay);
+    assert_eq!(fx.profile.live(), before, "the new profile stays");
+    assert!(fx.writer.plans().is_empty(), "nothing was written");
+    assert_eq!(fx.roots.calls.load(Ordering::SeqCst), 0);
+    assert!(fx.store.finished().is_empty());
+}
+
+/// The run passes its check of the mark after the wait, then pauses; another
+/// run finishes the erasure and the subject starts a new profile before this
+/// one removes anything more. The mark this store still shows stands for the
+/// check that passed just before the finish.
+#[tokio::test(start_paused = true)]
+async fn a_run_paused_after_its_check_leaves_the_new_profile_another_run_started() {
+    let fx = Fixture::new();
+    fx.store.mark_at(fx.key, OffsetDateTime::now_utc());
+    let deletion = Arc::new(fx.deletion(FixedDirectory::default()));
+    let running = tokio::spawn({
+        let deletion = Arc::clone(&deletion);
+        let key = fx.key;
+        async move { deletion.erase(key).await }
+    });
+    tokio::time::sleep(WINDOW / 3).await;
+    assert!(fx.profile.live().is_empty(), "the first removal ran");
+
+    // The subject's new profile, in the next generation.
+    let new = stored_fact(Category::Skill, "skills", json!({ "name": "Go" }), 10);
+    fx.profile.facts.lock().unwrap().push(new.clone());
+    fx.profile.generation.store(1, Ordering::SeqCst);
+    *fx.profile.version.lock().unwrap() = Some((1 << 32) | 1);
+
+    assert_eq!(running.await.unwrap().unwrap(), Erasure::NotUnderWay);
+    assert_eq!(fx.profile.live(), [new], "the new profile stays");
+    assert_eq!(fx.writer.plans().len(), 1, "only the first removal wrote");
+    assert_eq!(
+        fx.roots.calls.load(Ordering::SeqCst),
+        0,
+        "no root is removed"
+    );
+}

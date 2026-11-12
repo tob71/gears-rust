@@ -278,7 +278,7 @@ The system **MUST** supply a migration, `m006_erasure_retention`, that adds to `
 **Touches**:
 - DB Tables: `construct__subject_settings`, `construct__review_requests`, `construct__record_ids`
 
-**Verified by**: `a_row_stored_before_takes_generation_zero_and_a_second_run_is_a_no_op`, `the_step_back_is_refused_once_a_subject_was_erased` (migration), `the_finish_clears_the_mark_moves_the_generation_on_and_removes_only_the_subjects_rows`, `a_finish_without_a_mark_removes_nothing`, `the_stopped_erasures_are_those_marked_before_the_cut_of_any_tenant`, `an_erasure_marked_before_its_time_was_kept_counts_as_marked_long_ago`, `a_tenant_stays_known_after_retention_removed_its_rows` (store). The migration runs on `SQLite` in every test; the `MySQL` and `PostgreSQL` forms come from the schema builder and were not run.
+**Verified by**: `a_row_stored_before_takes_generation_zero_and_a_second_run_is_a_no_op`, `the_step_back_is_refused_once_a_subject_was_erased` (migration), `the_finish_clears_the_mark_moves_the_generation_on_and_removes_only_the_subjects_rows`, `a_finish_without_a_mark_removes_nothing`, `the_stopped_erasures_are_those_marked_before_the_cut_of_any_tenant`, `an_erasure_marked_before_its_time_was_kept_counts_as_marked_long_ago`, `a_tenant_stays_known_after_retention_removed_its_rows` (store), on `SQLite`; and on `PostgreSQL`, in the `construct-pg` lane (`make test-integration LANE=construct-pg`, Docker required), `m006_runs_twice_and_steps_back_only_while_no_subject_was_erased`, `the_mark_read_back_finishes_its_erasure_and_no_other` and `the_tenants_are_the_noted_ones_and_those_with_a_row`. The `MySQL` form comes from the schema builder and is not run.
 
 ### Deletion's Events
 

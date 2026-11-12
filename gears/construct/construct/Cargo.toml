@@ -88,9 +88,6 @@ toolkit-odata-macros = { workspace = true }
 # needs no release of graph storage that has it.
 graph-storage = { package = "cf-gears-graph-storage", path = "../../graph-storage/graph-storage", features = ["test-support"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
-# Path-only, like graph storage above: a test registers Construct's routes
-# beside the types registry's, as a host running both gears does.
-types-registry = { package = "cf-gears-types-registry", path = "../../system/types-registry/types-registry" }
 cluster-sdk = { workspace = true, features = ["test-util"] }
 toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 tower = { workspace = true, features = ["util"] }

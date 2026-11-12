@@ -88,7 +88,7 @@ gears:
         erasure_workers: 4           # erasures one instance runs at once
 ```
 
-Erasures that stopped, and retention, run on the cluster leader, elected through the platform cluster gear with the cluster profile `construct` (linearizable). A deployment without that profile runs neither, and says so in a warning; an erasure is still marked at once, so the profile read serves nothing about the subject, but one that stopped is not finished.
+Erasures that stopped, and retention, run on the cluster leader, elected through the platform cluster gear with the cluster profile `construct` (linearizable). `config/quickstart.yaml` and `config/e2e-local.yaml` bind it with the standalone provider. A deployment without that profile runs neither and says so in a warning, and resolves no election, so the host's readiness does not wait for the profile; an erasure is still marked at once, so the profile read serves nothing about the subject, but one that stopped is not finished.
 
 The model is called through OAGW, so a server with a `model` needs OAGW too: in the example server, add `oagw` to the features: `make run GEAR=construct GEAR_SERVER_EXTRA_FEATURES_construct=oagw`. Without it every model call fails as unavailable (`no OAGW client in ClientHub`), and no record is processed.
 

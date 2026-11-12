@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cluster_sdk::{LeaderElectionCapability, LeaderElectionV1};
+use cluster_sdk::{
+    ClusterClient, ClusterError, ClusterProfile as _, LeaderElectionCapability, LeaderElectionV1,
+};
 use futures::FutureExt as _;
 use time::OffsetDateTime;
 use tokio::sync::{Semaphore, mpsc};
@@ -450,7 +452,9 @@ impl cluster_sdk::ClusterProfile for ConstructProfile {
 }
 
 /// [`Leadership`] on the platform cluster gear's leader election, with the
-/// `construct` profile. A deployment without it runs no job, and says so.
+/// `construct` profile. A deployment without it runs no job, and says so: the
+/// election is not resolved then, since a resolve records the profile as a
+/// requirement of the whole host's readiness even when it is not bound.
 pub struct ClusterLeadership {
     hub: Arc<ClientHub>,
 }
@@ -486,6 +490,22 @@ impl ClusterLeadership {
         Self { hub }
     }
 
+    /// Whether the host binds the `construct` profile: false without a
+    /// cluster client or when the client says the profile is not bound. Any
+    /// other answer, a cluster that does not answer yet included, counts as
+    /// bound, and the election is resolved and tried again until it answers.
+    async fn bound(&self, cancel: &CancellationToken) -> bool {
+        let Some(client) = self.hub.try_get::<dyn ClusterClient>() else {
+            return false;
+        };
+        tokio::select! {
+            () = cancel.cancelled() => false,
+            descriptor = client.descriptor(ConstructProfile::NAME) => {
+                !matches!(descriptor, Err(ClusterError::ProfileNotBound { .. }))
+            }
+        }
+    }
+
     /// The election, resolved once the cluster gear answers; none when
     /// `cancel` fires first.
     async fn election(&self, cancel: &CancellationToken) -> Option<LeaderElectionV1> {
@@ -518,6 +538,17 @@ impl ClusterLeadership {
 impl Leadership for ClusterLeadership {
     async fn lead(&self, job: Arc<DeletionJob>, cancel: CancellationToken) {
         // @cpt-begin:cpt-cf-construct-algo-erasure-rerun:p1:inst-rerun-leader
+        if !self.bound(&cancel).await {
+            if !cancel.is_cancelled() {
+                tracing::warn!(
+                    profile = ConstructProfile::NAME,
+                    "construct: the host binds no `construct` cluster profile; the deletion job \
+                     does not run, so stopped erasures are not run again and nothing is removed \
+                     for retention"
+                );
+            }
+            return;
+        }
         let mut backoff = Backoff::new();
         loop {
             let Some(election) = self.election(&cancel).await else {
@@ -1263,9 +1294,49 @@ mod tests {
         running.await.unwrap();
     }
 
+    /// A host that binds no `construct` profile, with no cluster client or
+    /// one that binds other profiles only, resolves no election: a resolve
+    /// would record the profile as a requirement of the host's readiness and
+    /// keep every gear of the host from being ready.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_host_without_the_construct_profile_resolves_no_election_and_runs_no_job() {
+        for hub in [ClientHub::new(), {
+            let hub = ClientHub::new();
+            cluster_sdk::test_support::StubClusterClient::for_profile("oagw").register(&hub);
+            hub
+        }] {
+            let job = job();
+            let runner = Arc::new(DeletionJob {
+                deletion: Arc::clone(&job.deletion),
+                store: Arc::clone(&job.store) as _,
+                periods: periods(RetentionConfig::default()),
+                interval: Duration::from_secs(60),
+                retention_interval: Duration::from_secs(60),
+            });
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                ClusterLeadership::new(Arc::new(hub)).lead(runner, CancellationToken::new()),
+            )
+            .await
+            .expect("the leadership ends at once");
+
+            assert!(job.store.expired.lock().unwrap().is_empty(), "no job ran");
+        }
+        assert!(logs_contain("binds no `construct` cluster profile"));
+        assert!(
+            !logs_contain("no leader election for the deletion job")
+                && !logs_contain("election could not be joined"),
+            "no election was resolved"
+        );
+    }
+
+    /// A cluster that binds the profile but does not answer yet is resolved
+    /// and tried again.
     #[tracing_test::traced_test]
     #[tokio::test(start_paused = true)]
-    async fn without_a_cluster_gear_the_election_is_tried_again_after_a_pause() {
+    async fn a_cluster_that_does_not_answer_yet_is_tried_again_after_a_pause() {
         let job = job();
         let runner = Arc::new(DeletionJob {
             deletion: Arc::clone(&job.deletion),
@@ -1274,7 +1345,11 @@ mod tests {
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
         });
-        let leadership = ClusterLeadership::new(Arc::new(ClientHub::new()));
+        let hub = ClientHub::new();
+        cluster_sdk::test_support::StubClusterClient::for_profile("construct")
+            .without_descriptor()
+            .register(&hub);
+        let leadership = ClusterLeadership::new(Arc::new(hub));
         let cancel = CancellationToken::new();
         let tries = || {
             let tries = std::cell::Cell::new(0);
@@ -1282,7 +1357,10 @@ mod tests {
                 tries.set(
                     lines
                         .iter()
-                        .filter(|line| line.contains("election could not be joined"))
+                        .filter(|line| {
+                            line.contains("no leader election for the deletion job")
+                                || line.contains("election could not be joined")
+                        })
                         .count(),
                 );
                 Ok(())

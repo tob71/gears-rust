@@ -1,18 +1,23 @@
 //! A person's schema changed while the gear runs, through the gear's own wiring: the next message is planned,
 //! written and read over the schema as it is then.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use serde_json::json;
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::pipeline::{Pipeline, assemble_with};
 use super::storage::subject_schema_repo::SeaOrmSubjectSchemaRepository;
 use crate::config::{CategoryCheckConfig, ConstructConfig};
-use crate::domain::model_client::{ModelOutput, ModelResponse, ToolCall};
+use crate::domain::model_client::{
+    ModelClient, ModelError, ModelOutput, ModelRequest, ModelResponse, ToolCall, ToolSpec,
+};
 use crate::domain::profile_schema::SchemaChange;
 use crate::domain::schema_service::{SchemaService, StoredSchemas};
 use crate::domain::subject_settings::SubjectKey;
@@ -23,11 +28,11 @@ use crate::test_support::{
 };
 
 fn adds(kind: &str, value: &serde_json::Value) -> ModelResponse {
-    answer(ModelOutput::ToolCalls(vec![ToolCall {
-        id: "call_0".to_owned(),
-        name: "add".to_owned(),
-        arguments: json!({ "kind": kind, "value": value, "confidence": 0.9 }),
-    }]))
+    answer(ModelOutput::ToolCalls(vec![tool(
+        "call_0",
+        "add",
+        json!({ "kind": kind, "value": value, "confidence": 0.9 }),
+    )]))
 }
 
 fn complete() -> ModelResponse {
@@ -49,7 +54,7 @@ struct Gear {
     running: tokio::task::JoinHandle<()>,
 }
 
-async fn gear(model: Arc<Scripted>) -> Gear {
+async fn gear(model: Arc<impl ModelClient + 'static>) -> Gear {
     let db = inmem_db().await;
     let cfg = ConstructConfig {
         processing_identity: Some(Uuid::new_v4()),
@@ -114,8 +119,12 @@ impl Gear {
             .expect("intake answers");
     }
 
-    /// The kinds with facts the profile read serves.
-    async fn kinds(&self, tenant: Uuid, subject: Uuid) -> Vec<(String, serde_json::Value)> {
+    /// The nodes the profile read serves, each with the name of its kind.
+    async fn all(
+        &self,
+        tenant: Uuid,
+        subject: Uuid,
+    ) -> Vec<(String, crate::domain::profile_read::StoredFact)> {
         let reader = context_of(Uuid::new_v4(), tenant);
         let view = self
             .pipeline
@@ -130,9 +139,74 @@ impl Gear {
                 group
                     .facts
                     .into_iter()
-                    .map(move |fact| (name.clone(), fact.value))
+                    .map(move |fact| (name.clone(), fact))
             })
             .collect()
+    }
+
+    /// The kinds with nodes the profile read serves, each with the value of a node.
+    async fn kinds(&self, tenant: Uuid, subject: Uuid) -> Vec<(String, serde_json::Value)> {
+        let all = self.all(tenant, subject).await;
+        all.into_iter()
+            .map(|(kind, fact)| (kind, fact.value))
+            .collect()
+    }
+
+    /// The nodes of `kind` the profile read serves.
+    async fn nodes(
+        &self,
+        tenant: Uuid,
+        subject: Uuid,
+        kind: &str,
+    ) -> Vec<crate::domain::profile_read::StoredFact> {
+        let all = self.all(tenant, subject).await;
+        all.into_iter()
+            .filter(|(name, _)| name == kind)
+            .map(|(_, fact)| fact)
+            .collect()
+    }
+
+    /// Removes the node kind `kind` and the links that name it, as the host does; gives the changes that add them
+    /// back.
+    async fn remove_kind(
+        &self,
+        owner: &SecurityContext,
+        subject: Uuid,
+        kind: &str,
+    ) -> Vec<SchemaChange> {
+        let doc = self.schemas.schema(owner, subject).await.unwrap().schema;
+        let links: Vec<_> = doc
+            .links
+            .iter()
+            .filter(|link| link.from.iter().chain(&link.to).any(|end| end == kind))
+            .cloned()
+            .collect();
+        let node = doc
+            .nodes
+            .iter()
+            .find(|node| node.name == kind)
+            .unwrap()
+            .clone();
+        let mut removal: Vec<SchemaChange> = links
+            .iter()
+            .map(|link| SchemaChange::RemoveLinkKind {
+                name: link.name.clone(),
+            })
+            .collect();
+        removal.push(SchemaChange::RemoveNodeKind {
+            name: kind.to_owned(),
+        });
+        self.schemas
+            .change(owner, subject, &removal)
+            .await
+            .expect("the host removes the kind");
+        let mut restore = vec![SchemaChange::AddNodeKind { kind: node }];
+        restore.extend(
+            links
+                .into_iter()
+                .map(|kind| SchemaChange::AddLinkKind { kind }),
+        );
+        restore
     }
 
     async fn stop(self) {
@@ -395,6 +469,264 @@ async fn nodes_of_a_kind_the_schema_lost_are_hidden_from_every_read_and_swept_by
         gear.kinds(tenant, subject).await,
         [("person".to_owned(), json!({ "name": "Ann" }))],
         "the swept node does not come back with its kind"
+    );
+    gear.stop().await;
+}
+
+/// A model that answers as a script, keeps the tools its latest call was offered, and can hold its first call until
+/// a test lets it go.
+struct Offering {
+    script: Scripted,
+    offered: Mutex<Vec<ToolSpec>>,
+    hold: Option<(Arc<Notify>, Arc<Semaphore>)>,
+    started: AtomicBool,
+    /// The calls the model has had.
+    calls: AtomicUsize,
+}
+
+impl Offering {
+    fn new(answers: Vec<ModelResponse>) -> Arc<Self> {
+        Arc::new(Self {
+            script: Scripted(Mutex::new(answers.into())),
+            offered: Mutex::default(),
+            hold: None,
+            started: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    /// The first call tells `reached` and waits for a permit of `release`.
+    fn held(
+        answers: Vec<ModelResponse>,
+        reached: &Arc<Notify>,
+        release: &Arc<Semaphore>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            hold: Some((Arc::clone(reached), Arc::clone(release))),
+            ..Arc::into_inner(Self::new(answers)).unwrap()
+        })
+    }
+
+    /// Whether the `add` tool of the latest call takes nodes of `kind`.
+    fn offers(&self, kind: &str) -> bool {
+        let offered = self.offered.lock().unwrap();
+        let add = offered
+            .iter()
+            .find(|tool| tool.name == "add")
+            .expect("the model was offered the add tool");
+        add.parameters["properties"]["kind"]["enum"]
+            .as_array()
+            .expect("the add tool lists its kinds")
+            .iter()
+            .any(|name| name == kind)
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelClient for Offering {
+    async fn complete(
+        &self,
+        ctx: &SecurityContext,
+        request: &ModelRequest,
+    ) -> Result<ModelResponse, ModelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.offered.lock().unwrap() = request.tools.clone();
+        if let Some((reached, release)) = &self.hold
+            && !self.started.swap(true, Ordering::SeqCst)
+        {
+            reached.notify_one();
+            release.acquire().await.unwrap().forget();
+        }
+        self.script.complete(ctx, request).await
+    }
+}
+
+fn plan(calls: Vec<ToolCall>) -> ModelResponse {
+    answer(ModelOutput::ToolCalls(calls))
+}
+
+fn tool(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        arguments,
+    }
+}
+
+#[tokio::test]
+async fn the_kinds_offered_to_the_model_and_the_source_of_a_node_follow_the_schema() {
+    let rex = json!({ "name": "Rex", "species": "dog" });
+    let model = Offering::new(vec![
+        adds("person", &json!({ "name": "Ann" })),
+        complete(),
+        adds("pets", &rex),
+        complete(),
+    ]);
+    let gear = gear(Arc::clone(&model)).await;
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+
+    gear.send(tenant, subject, "chat/t/1").await;
+    until("the person", async || {
+        Some(gear.nodes(tenant, subject, "person").await).filter(|nodes| !nodes.is_empty())
+    })
+    .await;
+    assert!(!model.offers("pets"), "the default schema has no pets");
+
+    gear.schemas
+        .change(&context_of(subject, tenant), subject, &[pets()])
+        .await
+        .expect("the host adds the kind");
+    gear.send(tenant, subject, "chat/t/2").await;
+    let found = until("the pets node", async || {
+        Some(gear.nodes(tenant, subject, "pets").await).filter(|nodes| !nodes.is_empty())
+    })
+    .await;
+
+    assert!(model.offers("pets"), "the added kind is offered");
+    assert_eq!(found[0].value, rex);
+    let [learned] = found[0].learned.as_slice() else {
+        panic!("one source, got {:?}", found[0]);
+    };
+    assert_eq!(learned.message.as_deref(), Some("chat/t/2"));
+    gear.stop().await;
+}
+
+#[tokio::test]
+async fn a_kind_removed_is_no_longer_offered_and_its_nodes_are_gone_not_only_hidden() {
+    let model = Offering::new(vec![
+        plan(vec![
+            tool(
+                "a1",
+                "add",
+                json!({ "kind": "person", "value": { "name": "Ann" }, "confidence": 1.0 }),
+            ),
+            tool(
+                "a2",
+                "add",
+                json!({ "kind": "project", "value": { "name": "Rust" }, "confidence": 1.0 }),
+            ),
+            tool(
+                "a3",
+                "link",
+                json!({ "kind": "works_on", "from": 1, "to": 2, "confidence": 1.0 }),
+            ),
+        ]),
+        complete(),
+        adds("person", &json!({ "name": "Bob" })),
+        complete(),
+    ]);
+    let gear = gear(Arc::clone(&model)).await;
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let owner = context_of(subject, tenant);
+    let reader = context_of(Uuid::new_v4(), tenant);
+
+    gear.send(tenant, subject, "chat/t/1").await;
+    until("the project", async || {
+        Some(gear.nodes(tenant, subject, "project").await).filter(|nodes| !nodes.is_empty())
+    })
+    .await;
+    assert!(model.offers("project"));
+    let ann = gear.nodes(tenant, subject, "person").await.remove(0);
+    let linked = gear
+        .pipeline
+        .profile
+        .read_node(&reader, None, subject, &ann.node_key)
+        .await
+        .unwrap();
+    assert!(
+        linked
+            .neighbours
+            .iter()
+            .any(|group| group.link == "works_on")
+    );
+
+    // The kind goes, with the links that name it; added back, it has no node: they were deleted, not hidden. Ann
+    // shows no link to one either (the read skips a link to a node it cannot read, so this follows from that).
+    let restore = gear.remove_kind(&owner, subject, "project").await;
+    gear.schemas
+        .change(&owner, subject, &restore)
+        .await
+        .expect("the host adds the kind back");
+    assert!(gear.nodes(tenant, subject, "project").await.is_empty());
+    let after = gear
+        .pipeline
+        .profile
+        .read_node(&reader, None, subject, &ann.node_key)
+        .await
+        .unwrap();
+    assert!(after.neighbours.is_empty(), "{after:?}");
+
+    // Removed again, the next message is not offered the kind and is still learned.
+    gear.remove_kind(&owner, subject, "project").await;
+    gear.send(tenant, subject, "chat/t/2").await;
+    until("the second person", async || {
+        Some(gear.nodes(tenant, subject, "person").await).filter(|nodes| nodes.len() == 2)
+    })
+    .await;
+    assert!(!model.offers("project"), "the removed kind is not offered");
+    gear.stop().await;
+}
+
+#[tokio::test]
+async fn a_node_of_a_kind_removed_while_its_message_is_planned_is_not_stored() {
+    let (reached, release) = (Arc::new(Notify::new()), Arc::new(Semaphore::new(0)));
+    let model = Offering::held(
+        vec![
+            // A valid step and the one the removal will refuse.
+            plan(vec![
+                tool(
+                    "c1",
+                    "add",
+                    json!({ "kind": "person", "value": { "name": "Eve" }, "confidence": 1.0 }),
+                ),
+                tool(
+                    "c2",
+                    "add",
+                    json!({ "kind": "project", "value": { "name": "Rust" }, "confidence": 1.0 }),
+                ),
+            ]),
+            complete(),
+            adds("person", &json!({ "name": "Bob" })),
+            complete(),
+        ],
+        &reached,
+        &release,
+    );
+    let gear = gear(Arc::clone(&model)).await;
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let owner = context_of(subject, tenant);
+
+    // The first message is planned over the schema it started with, which has "project".
+    gear.send(tenant, subject, "chat/t/1").await;
+    tokio::time::timeout(Duration::from_secs(30), reached.notified())
+        .await
+        .expect("the first message is being planned");
+    let restore = gear.remove_kind(&owner, subject, "project").await;
+    release.add_permits(1);
+
+    // The plan adds Eve and a project the schema no longer has. The writer refuses the project and drops the plan
+    // whole, Eve with it, and the worker goes on to the next message.
+    gear.send(tenant, subject, "chat/t/2").await;
+    until("the person", async || {
+        Some(gear.nodes(tenant, subject, "person").await).filter(|nodes| !nodes.is_empty())
+    })
+    .await;
+    gear.schemas
+        .change(&owner, subject, &restore)
+        .await
+        .expect("the host adds the kind back");
+    // Not planned again over the new schema: the model had two calls for each message, and the only person, Bob, is
+    // the second message's.
+    assert_eq!(model.calls.load(Ordering::SeqCst), 4);
+    let [bob] = gear
+        .nodes(tenant, subject, "person")
+        .await
+        .try_into()
+        .unwrap();
+    assert_eq!(bob.learned[0].message.as_deref(), Some("chat/t/2"));
+    assert!(
+        gear.nodes(tenant, subject, "project").await.is_empty(),
+        "no project was written for the removed kind"
     );
     gear.stop().await;
 }

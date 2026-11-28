@@ -21,7 +21,7 @@ use uuid::Uuid;
 use super::pipeline::{MANAGE_BUDGET, assemble};
 use crate::config::{CategoryCheckConfig, ConstructConfig};
 use crate::domain::model_client::{
-    ModelClient, ModelError, ModelOutput, ModelRequest, ModelResponse, ToolCall,
+    Message, ModelClient, ModelError, ModelOutput, ModelRequest, ModelResponse, ToolCall,
 };
 use crate::domain::profile::Category;
 use crate::domain::profile_read::OriginKind;
@@ -1518,4 +1518,285 @@ async fn a_named_close_that_fails_once_is_closed_by_the_sweep_and_the_delete_is_
         learned.closed_as_deleted_by(&learned.project),
     );
     assert_eq!(closers, (Some(learned.subject), Some(learned.subject)));
+}
+
+/// A model that plays the story's two messages by what the profile shows it: the first teaches Priya, the project
+/// and a promise; the second names the same person and project again, so it tries to add them and then adds a
+/// promise to the nodes the profile holds.
+struct Reactive;
+
+impl Reactive {
+    /// The number of the profile line whose text starts with `needle`.
+    fn line(profile: &str, needle: &str) -> Option<usize> {
+        profile.lines().find_map(|line| {
+            let (number, rest) = line.split_once(". ")?;
+            rest.starts_with(needle)
+                .then(|| number.parse().ok())
+                .flatten()
+        })
+    }
+}
+
+#[async_trait]
+impl ModelClient for Reactive {
+    async fn complete(
+        &self,
+        _ctx: &SecurityContext,
+        request: &ModelRequest,
+    ) -> Result<ModelResponse, ModelError> {
+        let call = |id: &str, name: &str, arguments: serde_json::Value| ToolCall {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            arguments,
+        };
+        if request
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult { .. }))
+        {
+            return Ok(answer(ModelOutput::Text(
+                "The plan is complete.".to_owned(),
+            )));
+        }
+        let shown = request
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .find(|text| text.contains("<profile>"))
+            .expect("the planner shows the profile");
+        let profile = shown
+            .split("<profile>")
+            .nth(1)
+            .and_then(|rest| rest.split("</profile>").next())
+            .unwrap_or_default();
+        let calls = if let (Some(priya), Some(project)) = (
+            Self::line(profile, "person: "),
+            Self::line(profile, "project: "),
+        ) {
+            let lines = profile.lines().filter(|line| line.contains(". ")).count();
+            vec![
+                call(
+                    "d1",
+                    "add",
+                    json!({ "kind": "person", "value": { "name": "Priya Shah", "space": "work" }, "confidence": 1.0 }),
+                ),
+                call(
+                    "d2",
+                    "add",
+                    json!({ "kind": "project", "value": { "name": "Construct Browser onboarding" }, "confidence": 1.0 }),
+                ),
+                call(
+                    "d3",
+                    "add",
+                    json!({
+                        "kind": "commitment",
+                        "value": { "kind": "promise", "text": "review the draft", "due": "2026-09-14" },
+                        "owner": project,
+                        "confidence": 1.0
+                    }),
+                ),
+                call(
+                    "d4",
+                    "link",
+                    json!({ "kind": "owner", "from": lines + 1, "to": priya, "confidence": 1.0 }),
+                ),
+            ]
+        } else {
+            vec![
+                call(
+                    "c1",
+                    "add",
+                    json!({ "kind": "person", "value": { "name": "Priya Shah", "space": "work" }, "confidence": 1.0 }),
+                ),
+                call(
+                    "c2",
+                    "add",
+                    json!({ "kind": "project", "value": { "name": "Construct Browser onboarding" }, "confidence": 1.0 }),
+                ),
+                call(
+                    "c3",
+                    "link",
+                    json!({ "kind": "works_on", "from": 1, "to": 2, "confidence": 1.0 }),
+                ),
+                call(
+                    "c4",
+                    "add",
+                    json!({
+                        "kind": "commitment",
+                        "value": { "kind": "promise", "text": "send the interview script", "due": "2026-09-11" },
+                        "owner": 2,
+                        "confidence": 1.0
+                    }),
+                ),
+                call(
+                    "c5",
+                    "link",
+                    json!({ "kind": "owner", "from": 3, "to": 1, "confidence": 1.0 }),
+                ),
+            ]
+        };
+        Ok(answer(ModelOutput::ToolCalls(calls)))
+    }
+}
+
+#[tokio::test]
+async fn a_second_message_naming_the_same_person_and_project_adds_to_them_without_a_second_node() {
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+    let pipeline = assemble(
+        &cfg,
+        Some(Arc::new(Reactive)),
+        fake_graph_storage(),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
+    )
+    .expect("the pipeline assembles");
+    let worker = pipeline.worker.expect("processing is wired");
+    let intake = IntakeFixture {
+        hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
+        ..IntakeFixture::default()
+    }
+    .build(&db);
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let cancel = CancellationToken::new();
+    let running = tokio::spawn(worker.run(cancel.clone()));
+    let reader = in_tenant(tenant);
+    let wait_for = |facts: usize| {
+        let (profile, reader) = (&pipeline.profile, &reader);
+        async move {
+            let read_back = async {
+                loop {
+                    let view = profile.read(reader, None, subject).await.unwrap();
+                    let held = view
+                        .categories
+                        .iter()
+                        .map(|group| group.facts.len())
+                        .sum::<usize>();
+                    if held >= facts {
+                        return view;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(30), read_back)
+                .await
+                .expect("the record is processed")
+        }
+    };
+    // The tool a node records is the connector that sent the message: this identity.
+    let connector = in_tenant(Uuid::new_v4());
+    let tool = connector.subject_id().to_string();
+    let submit = |provenance: &'static str| {
+        let (intake, connector) = (&intake, &connector);
+        async move {
+            intake
+                .submit(connector, tenant, chat_record(subject, provenance, "v1"))
+                .await
+                .expect("intake answers");
+        }
+    };
+
+    // The first message: a person, a project, the link between them and a promise they own.
+    submit("chat/t/1").await;
+    let first = wait_for(3).await;
+    let node = |view: &crate::domain::profile_read::ProfileView, kind: &str| {
+        view.categories
+            .iter()
+            .find(|group| group.category.name() == kind)
+            .map(|group| group.facts.clone())
+            .unwrap_or_default()
+    };
+    let (priya, project) = (
+        node(&first, "person").remove(0),
+        node(&first, "project").remove(0),
+    );
+    let promise = node(&first, "commitment").remove(0);
+    assert_eq!(priya.value["name"], "Priya Shah");
+    assert_eq!(project.value["name"], "Construct Browser onboarding");
+    assert_eq!(promise.value["kind"], "promise");
+    assert_eq!(promise.value["due"], "2026-09-11");
+    assert_eq!(promise.owner.as_ref(), Some(&project.node_key));
+    for held in [&priya, &project, &promise] {
+        let [learned] = held.learned.as_slice() else {
+            panic!("one source, got {held:?}");
+        };
+        assert_eq!(learned.tool, tool, "the connector that sent the message");
+        assert_eq!(learned.message.as_deref(), Some("chat/t/1"));
+    }
+    let details = pipeline
+        .profile
+        .read_node(&reader, None, subject, &priya.node_key)
+        .await
+        .unwrap();
+    let targets = |details: &crate::domain::profile_read::NodeDetails, link: &str| {
+        details
+            .neighbours
+            .iter()
+            .find(|group| group.link == link)
+            .map(|group| {
+                group
+                    .neighbours
+                    .iter()
+                    .map(|n| n.node.node_key.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        targets(&details, "works_on"),
+        std::slice::from_ref(&project.node_key)
+    );
+    assert_eq!(
+        targets(&details, "owner"),
+        std::slice::from_ref(&promise.node_key)
+    );
+
+    // The second message names Priya and the project again: no second node of either, one more promise.
+    submit("chat/t/2").await;
+    let second = wait_for(4).await;
+    cancel.cancel();
+    running.await.unwrap();
+    assert_eq!(node(&second, "person").len(), 1, "{second:?}");
+    assert_eq!(node(&second, "project").len(), 1, "{second:?}");
+    let promises = node(&second, "commitment");
+    assert_eq!(promises.len(), 2, "{second:?}");
+    assert!(
+        promises
+            .iter()
+            .all(|p| p.owner.as_ref() == Some(&project.node_key)),
+        "both promises belong to the one project"
+    );
+    let newer = promises
+        .iter()
+        .find(|p| p.value["text"] == "review the draft")
+        .expect("the second message's promise");
+    assert_eq!(newer.learned[0].message.as_deref(), Some("chat/t/2"));
+    assert_eq!(newer.learned[0].tool, tool);
+    let after = pipeline
+        .profile
+        .read_node(&reader, None, subject, &priya.node_key)
+        .await
+        .unwrap();
+    let mut owned = targets(&after, "owner");
+    owned.sort();
+    let mut both = vec![promise.node_key.clone(), newer.node_key.clone()];
+    both.sort();
+    assert_eq!(owned, both, "Priya owns both promises");
+    assert_eq!(
+        targets(&after, "works_on"),
+        std::slice::from_ref(&project.node_key)
+    );
 }
